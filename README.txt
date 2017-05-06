@@ -92,6 +92,7 @@ its command line interface and options.
                           x15         use to mine Halcyon
                           x17         use to mine X17
                           lyra2v2     use to mine Vertcoin
+                          xevan       use to mine bitsend
 
   -d, --devices         gives a comma separated list of CUDA device IDs
                         to operate on. Device IDs start counting from 0!
