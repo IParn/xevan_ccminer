@@ -1,5 +1,5 @@
 <?php
-/* ccminer API sample UI */
+/* ccminer API sample UI (API 1.9) */
 
 $host = 'http://localhost/api/'; // 'http://'.$_SERVER['SERVER_NAME'].'/api/';
 $configs = array(
@@ -27,8 +27,8 @@ function getdataFromPeers()
 function ignoreField($key)
 {
 	$ignored = array(
-		'API','VER','GPU','BUS',
-		'CARD','GPUS','CPU','TS',
+		'API','VER','GPU','BUS','POOLS',
+		'CARD','GPUS','CPU','TS','URL',
 	);
 	return in_array($key, $ignored);
 }
@@ -46,18 +46,33 @@ function translateField($key)
 	$intl['ACC'] = 'Accepted shares';
 	$intl['ACCMN'] = 'Accepted / mn';
 	$intl['REJ'] = 'Rejected';
+	$intl['SOLV'] = 'Solved';
+	$intl['BEST'] = 'Best share';
+	$intl['STALE'] = 'Stale shares';
+	$intl['LAST'] = 'Last share';
 	$intl['DIFF'] = 'Difficulty';
+	$intl['NETKHS'] = 'Net Rate';
 	$intl['UPTIME'] = 'Miner up time';
 	$intl['TS'] = 'Last update';
 	$intl['THR'] = 'Throughput';
+	$intl['WAIT'] = 'Wait time';
 
 	$intl['H'] = 'Bloc height';
 	$intl['I'] = 'Intensity';
 	$intl['HWF'] = 'Failures';
+	$intl['POOL'] = 'Pool';
+	$intl['POOLS'] = 'Pools';
 
 	$intl['TEMP'] = 'T°c';
 	$intl['FAN'] = 'Fan %';
-	$intl['FREQ'] = 'Freq.';
+	$intl['CPUFREQ'] = 'CPU Freq.';
+	$intl['FREQ'] = 'Base Freq.';
+	$intl['MEMFREQ'] = 'Mem. Freq.';
+	$intl['GPUF'] = 'Curr Freq.';
+	$intl['MEMF'] = 'Mem. Freq.';
+	$intl['KHW'] = 'Efficiency';
+	$intl['POWER'] = 'Power';
+	$intl['PLIM'] = 'P.Limit';
 	$intl['PST'] = 'P-State';
 
 	// pool infos
@@ -76,6 +91,7 @@ function translateValue($key,$val,$data=array())
 {
 	switch ($key) {
 		case 'UPTIME':
+		case 'WAIT':
 			$min = floor(intval($val) / 60);
 			$sec = intval($val) % 60;
 			$val = "${min}mn${sec}s";
@@ -88,14 +104,25 @@ function translateValue($key,$val,$data=array())
 		case 'NAME':
 			$val = $data['NAME'].'&nbsp;'.$data['VER'];
 			break;
+		case 'CPUFREQ':
 		case 'FREQ':
-			$val = sprintf("%d MHz", round(floatval($val)/1000.0));
+		case 'MEMFREQ':
+		case 'GPUF':
+		case 'MEMF':
+			$val = sprintf("%d MHz", $val);
+			break;
+		case 'POWER':
+			$val = sprintf("%d W", round(floatval($val)/1000.0));
 			break;
 		case 'TS':
 			$val = strftime("%H:%M:%S", (int) $val);
 			break;
 		case 'KHS':
+		case 'NETKHS':
 			$val = '<span class="bold">'.$val.'</span> kH/s';
+			break;
+		case 'KHW':
+			$val = $val.' kH/W';
 			break;
 		case 'NAME':
 		case 'POOL';
@@ -221,7 +248,7 @@ div#footer {
 #header h1 { padding: 12px; font-size: 20px; }
 #footer p { margin: 12px 24px; }
 
-table.stats { width: 280px; margin: 4px 16px; display: inline-block; }
+table.stats { width: 280px; margin: 4px 16px; display: inline-block; vertical-align: top; }
 th.machine { color: darkcyan; padding: 16px 0px 0px 0px; text-align: left; border-bottom: 1px solid gray; }
 th.gpu { color: white; padding: 3px 3px; font: bolder; text-align: left; background: rgba(65, 65, 65, 0.85); }
 td.key { width: 99px; max-width: 180px; }
@@ -246,7 +273,7 @@ span.elipsis { display: inline-block; max-width: 130px; overflow: hidden; }
 </div>
 
 <div id="footer">
-<p>&copy; 2014 <a href="http://github.com/tpruvot/ccminer">tpruvot@github</a></p>
+<p>&copy; 2014-2015 <a href="http://github.com/tpruvot/ccminer">tpruvot@github</a></p>
 </div>
 
 </body>

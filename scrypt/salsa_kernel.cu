@@ -1,9 +1,6 @@
-
 //
 // Contains the autotuning logic and some utility functions.
 // Note that all CUDA kernels have been moved to other .cu files
-//
-// NOTE: compile this .cu module for compute_20,sm_21 with --maxrregcount=64
 //
 
 #include <stdio.h>
@@ -15,56 +12,41 @@
 
 #include "salsa_kernel.h"
 
+#include "nv_kernel2.h"
 #include "titan_kernel.h"
+#include "nv_kernel.h"
+#include "kepler_kernel.h"
 #include "fermi_kernel.h"
 #include "test_kernel.h"
-#include "nv_kernel.h"
-#include "nv_kernel2.h"
-#include "kepler_kernel.h"
 
 #include "miner.h"
 
-#if WIN32
-#ifdef _WIN64
-#define _64BIT 1
-#endif
-#else
-#if __x86_64__
-#define _64BIT 1
-#endif
-#endif
-
-#if _64BIT
+#if defined(_WIN64) || defined(__x86_64__) || defined(__64BIT__)
 #define MAXMEM 0x300000000ULL  // 12 GB (the largest Kepler)
 #else
 #define MAXMEM  0xFFFFFFFFULL  // nearly 4 GB (32 bit limitations)
 #endif
 
 // require CUDA 5.5 driver API
-#define DMAJ 6
+#define DMAJ 5
 #define DMIN 5
 
 // define some error checking macros
-#undef checkCudaErrors
-
-#if WIN32
 #define DELIMITER '/'
-#else
-#define DELIMITER '/'
-#endif
 #define __FILENAME__ ( strrchr(__FILE__, DELIMITER) != NULL ? strrchr(__FILE__, DELIMITER)+1 : __FILE__ )
 
+#undef checkCudaErrors
 #define checkCudaErrors(x) \
 { \
 	cudaGetLastError(); \
 	x; \
 	cudaError_t err = cudaGetLastError(); \
-	if (err != cudaSuccess) \
+	if (err != cudaSuccess && !abort_flag) \
 		applog(LOG_ERR, "GPU #%d: Err %d: %s (%s:%d)", device_map[thr_id], err, cudaGetErrorString(err), __FILENAME__, __LINE__); \
 }
 
 // some globals containing pointers to device memory (for chunked allocation)
-// [MAX_DEVICES] indexes up to MAX_DEVICES threads (0...MAX_DEVICES-1)
+// [MAX_GPUS] indexes up to MAX_GPUS threads (0...MAX_GPUS-1)
 int       MAXWARPS[MAX_GPUS];
 uint32_t* h_V[MAX_GPUS][TOTAL_WARP_LIMIT*64];          // NOTE: the *64 prevents buffer overflow for --keccak
 uint32_t  h_V_extra[MAX_GPUS][TOTAL_WARP_LIMIT*64];    //       with really large kernel launch configurations
@@ -72,19 +54,27 @@ uint32_t  h_V_extra[MAX_GPUS][TOTAL_WARP_LIMIT*64];    //       with really larg
 KernelInterface *Best_Kernel_Heuristics(cudaDeviceProp *props)
 {
 	KernelInterface *kernel = NULL;
-	uint32_t N = (1UL << opt_nfactor+1); // not sure
+	uint64_t N = 1UL << (opt_nfactor+1);
 
 	if (IS_SCRYPT() || (IS_SCRYPT_JANE() && N <= 8192))
 	{
 		// high register count kernels (scrypt, low N-factor scrypt-jane)
 		if (props->major > 3 || (props->major == 3 && props->minor >= 5))
 			kernel = new NV2Kernel(); // we don't want this for Keccak though
+		else if (props->major == 3 && props->minor == 0)
+			kernel = new NVKernel();
+		else
+			kernel = new FermiKernel();
 	}
 	else
 	{
-	   // low register count kernels (high N-factor scrypt-jane)
+	   // high N-factor scrypt-jane = low registers count kernels
 	   if (props->major > 3 || (props->major == 3 && props->minor >= 5))
 			kernel = new TitanKernel();
+		else if (props->major == 3 && props->minor == 0)
+			kernel = new KeplerKernel();
+		else
+			kernel = new TestKernel();
 	}
 	return kernel;
 }
@@ -113,8 +103,12 @@ bool validate_config(char *config, int &b, int &w, KernelInterface **kernel = NU
 			{
 				case 'T': case 'Z': *kernel = new NV2Kernel(); break;
 				case 't':           *kernel = new TitanKernel(); break;
+				case 'K': case 'Y': *kernel = new NVKernel(); break;
+				case 'k':           *kernel = new KeplerKernel(); break;
+				case 'F': case 'L': *kernel = new FermiKernel(); break;
+				case 'f': case 'X': *kernel = new TestKernel(); break;
 				case ' ': // choose based on device architecture
-					*kernel = new NV2Kernel();
+					*kernel = Best_Kernel_Heuristics(props);
 				break;
 			}
 		}
@@ -140,13 +134,6 @@ std::map<int, uint32_t *> context_hash[2];
 
 int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurrent, int &wpb);
 
-void cuda_shutdown(int thr_id)
-{
-	cudaDeviceSynchronize();
-	cudaDeviceReset();
-	cudaThreadExit();
-}
-
 int cuda_throughput(int thr_id)
 {
 	int GRID_BLOCKS, WARPS_PER_BLOCK;
@@ -157,9 +144,8 @@ int cuda_throughput(int thr_id)
 		cuCtxCreate( &ctx, CU_CTX_SCHED_YIELD, device_map[thr_id] );
 		cuCtxSetCurrent(ctx);
 #else
-		checkCudaErrors(cudaSetDeviceFlags(cudaDeviceScheduleYield));
 		checkCudaErrors(cudaSetDevice(device_map[thr_id]));
-		checkCudaErrors(cudaFree(0));
+		checkCudaErrors(cudaSetDeviceFlags(cudaDeviceScheduleYield));
 #endif
 
 		KernelInterface *kernel;
@@ -169,9 +155,9 @@ int cuda_throughput(int thr_id)
 		if(GRID_BLOCKS == 0)
 			return 0;
 
-		uint32_t THREADS_PER_WU = kernel->threads_per_wu();
-		uint32_t mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * 32;
-		uint32_t state_size = WU_PER_LAUNCH * sizeof(uint32_t) * 8;
+		unsigned int THREADS_PER_WU = kernel->threads_per_wu();
+		unsigned int mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * 32;
+		unsigned int state_size = WU_PER_LAUNCH * sizeof(uint32_t) * 8;
 
 		// allocate device memory for scrypt_core inputs and outputs
 		uint32_t *tmp;
@@ -203,7 +189,7 @@ int cuda_throughput(int thr_id)
 				checkCudaErrors(cudaMalloc((void **) &tmp, state_size)); context_hash[1][thr_id] = tmp;
 			}
 		}
-		else if (IS_SCRYPT_JANE())
+		else /* if (IS_SCRYPT_JANE()) */
 		{
 			// allocate pinned host memory for scrypt_core input/output
 			checkCudaErrors(cudaHostAlloc((void **) &tmp, mem_size, cudaHostAllocDefault)); context_X[0][thr_id] = tmp;
@@ -232,7 +218,7 @@ int cuda_throughput(int thr_id)
 
 	GRID_BLOCKS = context_blocks[thr_id];
 	WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
+	unsigned int THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
 	return WU_PER_LAUNCH;
 }
 
@@ -269,7 +255,7 @@ inline int _ConvertSMVer2Cores(int major, int minor)
 	}
 
 	// If we don't find the values, we default use the previous one to run properly
-    applog(LOG_WARNING, "MapSMtoCores for SM %d.%d is undefined. Default to use %d Cores/SM", major, minor, 128);
+	applog(LOG_WARNING, "MapSMtoCores for SM %d.%d is undefined. Default to use %d Cores/SM", major, minor, 128);
 	return 128;
 }
 
@@ -295,9 +281,6 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 	checkCudaErrors(cudaGetDeviceProperties(&props, device_map[thr_id]));
 	concurrent = (props.concurrentKernels > 0);
 
-	device_name[thr_id] = strdup(props.name);
-	applog(LOG_INFO, "GPU #%d: %s with SM %d.%d", device_map[thr_id], props.name, props.major, props.minor);
-
 	WARPS_PER_BLOCK = -1;
 
 	// if not specified, use interactive mode for devices that have the watchdog timer enabled
@@ -315,12 +298,21 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 	// figure out which kernel implementation to use
 	if (!validate_config(device_config[thr_id], optimal_blocks, WARPS_PER_BLOCK, &kernel, &props)) {
 		kernel = NULL;
-		if (device_config[thr_id] != NULL) 
-		{
-			 if (device_config[thr_id][0] == 'T' || device_config[thr_id][0] == 'Z')
+		if (device_config[thr_id] != NULL) {
+				 if (device_config[thr_id][0] == 'T' || device_config[thr_id][0] == 'Z')
 				kernel = new NV2Kernel();
+			else if (device_config[thr_id][0] == 't')
+				kernel = new TitanKernel();
+			else if (device_config[thr_id][0] == 'K' || device_config[thr_id][0] == 'Y')
+				kernel = new NVKernel();
+			else if (device_config[thr_id][0] == 'k')
+				kernel = new KeplerKernel();
+			else if (device_config[thr_id][0] == 'F' || device_config[thr_id][0] == 'L')
+				kernel = new FermiKernel();
+			else if (device_config[thr_id][0] == 'f' || device_config[thr_id][0] == 'X')
+				kernel = new TestKernel();
 		}
-		if (kernel == NULL) kernel = new NV2Kernel();
+		if (kernel == NULL) kernel = Best_Kernel_Heuristics(&props);
 	}
 
 	if (kernel->get_major_version() > props.major || kernel->get_major_version() == props.major && kernel->get_minor_version() > props.minor)
@@ -354,16 +346,18 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 		device_lookup_gap[thr_id] = 1;
 	}
 
-	applog(LOG_INFO, "GPU #%d: interactive: %d, tex-cache: %d%s, single-alloc: %d", device_map[thr_id],
+	if (opt_debug) {
+		applog(LOG_INFO, "GPU #%d: interactive: %d, tex-cache: %d%s, single-alloc: %d", device_map[thr_id],
 		   (device_interactive[thr_id]  != 0) ? 1 : 0,
 		   (device_texturecache[thr_id] != 0) ? device_texturecache[thr_id] : 0, (device_texturecache[thr_id] != 0) ? "D" : "",
 		   (device_singlememory[thr_id] != 0) ? 1 : 0 );
+	}
 
 	// number of threads collaborating on one work unit (hash)
-	uint32_t THREADS_PER_WU = kernel->threads_per_wu();
-	uint32_t LOOKUP_GAP = device_lookup_gap[thr_id];
-	uint32_t BACKOFF = device_backoff[thr_id];
-	uint32_t N = (1 << (opt_nfactor+1));
+	unsigned int THREADS_PER_WU = kernel->threads_per_wu();
+	unsigned int LOOKUP_GAP = device_lookup_gap[thr_id];
+	unsigned int BACKOFF = device_backoff[thr_id];
+	unsigned int N = (1 << (opt_nfactor+1));
 	double szPerWarp = (double)(SCRATCH * WU_PER_WARP * sizeof(uint32_t));
 	//applog(LOG_INFO, "WU_PER_WARP=%u, THREADS_PER_WU=%u, LOOKUP_GAP=%u, BACKOFF=%u, SCRATCH=%u", WU_PER_WARP, THREADS_PER_WU, LOOKUP_GAP, BACKOFF, SCRATCH);
 	applog(LOG_INFO, "GPU #%d: %d hashes / %.1f MB per warp.", device_map[thr_id], WU_PER_WARP, szPerWarp / (1024.0 * 1024.0));
@@ -482,9 +476,7 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 		}
 		MAXWARPS[thr_id] = warp;
 	}
-	if (IS_SCRYPT() || IS_SCRYPT_JANE()) {
-		kernel->set_scratchbuf_constants(MAXWARPS[thr_id], h_V[thr_id]);
-	}
+	kernel->set_scratchbuf_constants(MAXWARPS[thr_id], h_V[thr_id]);
 
 	if (validate_config(device_config[thr_id], optimal_blocks, WARPS_PER_BLOCK))
 	{
@@ -505,34 +497,22 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 		if (device_config[thr_id] != NULL && strcasecmp("auto", device_config[thr_id]))
 			applog(LOG_WARNING, "GPU #%d: Given launch config '%s' does not validate.", device_map[thr_id], device_config[thr_id]);
 
-		if (autotune)
+		if (opt_autotune)
 		{
 			applog(LOG_INFO, "GPU #%d: Performing auto-tuning, please wait 2 minutes...", device_map[thr_id]);
 
 			// allocate device memory
 			uint32_t *d_idata = NULL, *d_odata = NULL;
-			if (IS_SCRYPT() || IS_SCRYPT_JANE()) {
-				uint32_t mem_size = MAXWARPS[thr_id] * WU_PER_WARP * sizeof(uint32_t) * 32;
-				checkCudaErrors(cudaMalloc((void **) &d_idata, mem_size));
-				checkCudaErrors(cudaMalloc((void **) &d_odata, mem_size));
+			unsigned int mem_size = MAXWARPS[thr_id] * WU_PER_WARP * sizeof(uint32_t) * 32;
+			checkCudaErrors(cudaMalloc((void **) &d_idata, mem_size));
+			checkCudaErrors(cudaMalloc((void **) &d_odata, mem_size));
 
-				// pre-initialize some device memory
-				uint32_t *h_idata = (uint32_t*)malloc(mem_size);
-				for (uint32_t i=0; i < mem_size/sizeof(uint32_t); ++i) h_idata[i] = i*2654435761UL; // knuth's method
-				checkCudaErrors(cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice));
-				free(h_idata);
-			}
-#if 0
-			else if (opt_algo == ALGO_KECCAK) {
-				uint32_t pdata[20] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20};
-				uint32_t ptarget[8] = {0,0,0,0,0,0,0,0};
-				kernel->prepare_keccak256(thr_id, pdata, ptarget);
-			} else if (opt_algo == ALGO_BLAKE) {
-				uint32_t pdata[20] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20};
-				uint32_t ptarget[8] = {0,0,0,0,0,0,0,0};
-				kernel->prepare_blake256(thr_id, pdata, ptarget);
-			}
-#endif
+			// pre-initialize some device memory
+			uint32_t *h_idata = (uint32_t*)malloc(mem_size);
+			for (unsigned int i=0; i < mem_size/sizeof(uint32_t); ++i) h_idata[i] = i*2654435761UL; // knuth's method
+			checkCudaErrors(cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice));
+			free(h_idata);
+
 			double best_hash_sec = 0.0;
 			int best_wpb = 0;
 
@@ -572,11 +552,10 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 							int repeat = 0;
 							do  // average several measurements for better exactness
 							{
-								if (IS_SCRYPT() || IS_SCRYPT_JANE())
-									kernel->run_kernel(
-										grid, threads, WARPS_PER_BLOCK, thr_id, NULL,
-										d_idata, d_odata, N, LOOKUP_GAP, device_interactive[thr_id], true, device_texturecache[thr_id]
-									);
+								kernel->run_kernel(
+									grid, threads, WARPS_PER_BLOCK, thr_id, NULL, d_idata, d_odata, N,
+									LOOKUP_GAP, device_interactive[thr_id], true, device_texturecache[thr_id]
+								);
 								if(cudaDeviceSynchronize() != cudaSuccess)
 									break;
 								++repeat;
@@ -589,8 +568,11 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 
 							// for scrypt: in interactive mode only find launch configs where kernel launch times are short enough
 							// TODO: instead we could reduce the batchsize parameter to meet the launch time requirement.
-							if (IS_SCRYPT() && device_interactive[thr_id] && GRID_BLOCKS > 2*props.multiProcessorCount && tdelta > 1.0/30)
+							if (IS_SCRYPT() && device_interactive[thr_id]
+								&& GRID_BLOCKS > 2*props.multiProcessorCount && tdelta > 1.0/30)
+							{
 								if (WARPS_PER_BLOCK == 1) goto skip; else goto skip2;
+							}
 
 							hash_sec = (double)WU_PER_LAUNCH / tdelta;
 							Hash[WARPS_PER_BLOCK] = hash_sec;
@@ -601,8 +583,9 @@ int find_optimal_blockcount(int thr_id, KernelInterface* &kernel, bool &concurre
 							}
 						}
 					}
-skip2:              ;
+skip2:
 					if (opt_debug) {
+
 						if (GRID_BLOCKS == MINB) {
 							char line[512] = "    ";
 							for (int i=1; i<=kernel->max_warps_per_block(); ++i) {
@@ -648,10 +631,8 @@ skip2:              ;
 skip:           ;
 			}
 
-			if (IS_SCRYPT() || IS_SCRYPT_JANE()) {
-				checkCudaErrors(cudaFree(d_odata));
-				checkCudaErrors(cudaFree(d_idata));
-			}
+			checkCudaErrors(cudaFree(d_odata));
+			checkCudaErrors(cudaFree(d_idata));
 
 			WARPS_PER_BLOCK = best_wpb;
 			applog(LOG_INFO, "GPU #%d: %7.2f hash/s with configuration %c%dx%d", device_map[thr_id], best_hash_sec, kernel->get_identifier(), optimal_blocks, WARPS_PER_BLOCK);
@@ -755,9 +736,7 @@ skip:           ;
 				}
 
 				// update pointers to scratch buffer in constant memory after reallocation
-				if (IS_SCRYPT() || IS_SCRYPT_JANE()) {
-					kernel->set_scratchbuf_constants(MAXWARPS[thr_id], h_V[thr_id]);
-				}
+				kernel->set_scratchbuf_constants(MAXWARPS[thr_id], h_V[thr_id]);
 			}
 			else
 			{
@@ -780,10 +759,10 @@ skip:           ;
 
 void cuda_scrypt_HtoD(int thr_id, uint32_t *X, int stream)
 {
-	uint32_t GRID_BLOCKS = context_blocks[thr_id];
-	uint32_t WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
-	uint32_t mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * 32;
+	unsigned int GRID_BLOCKS = context_blocks[thr_id];
+	unsigned int WARPS_PER_BLOCK = context_wpb[thr_id];
+	unsigned int THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
+	unsigned int mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * 32;
 
 	// copy host memory to device
 	cudaMemcpyAsync(context_idata[stream][thr_id], X, mem_size, cudaMemcpyHostToDevice, context_streams[stream][thr_id]);
@@ -793,7 +772,7 @@ void cuda_scrypt_serialize(int thr_id, int stream)
 {
 	// if the device can concurrently execute multiple kernels, then we must
 	// wait for the serialization event recorded by the other stream
-	//if (context_concurrent[thr_id] || device_interactive[thr_id])
+	if (context_concurrent[thr_id] || device_interactive[thr_id])
 		cudaStreamWaitEvent(context_streams[stream][thr_id], context_serialize[(stream+1)&1][thr_id], 0);
 }
 
@@ -809,63 +788,29 @@ void cuda_scrypt_flush(int thr_id, int stream)
 	cudaStreamSynchronize(context_streams[stream][thr_id]);
 }
 
-void cuda_scrypt_core(int thr_id, int stream, uint32_t N)
+void cuda_scrypt_core(int thr_id, int stream, unsigned int N)
 {
-	uint32_t GRID_BLOCKS = context_blocks[thr_id];
-	uint32_t WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
-	uint32_t LOOKUP_GAP = device_lookup_gap[thr_id];
+	unsigned int GRID_BLOCKS = context_blocks[thr_id];
+	unsigned int WARPS_PER_BLOCK = context_wpb[thr_id];
+	unsigned int THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
+	unsigned int LOOKUP_GAP = device_lookup_gap[thr_id];
 
 	// setup execution parameters
-	dim3  grid(WU_PER_LAUNCH/WU_PER_BLOCK, 1, 1);
-	dim3  threads(THREADS_PER_WU*WU_PER_BLOCK, 1, 1);
+	dim3 grid(WU_PER_LAUNCH/WU_PER_BLOCK, 1, 1);
+	dim3 threads(THREADS_PER_WU*WU_PER_BLOCK, 1, 1);
 
-	context_kernel[thr_id]->run_kernel(grid, threads, WARPS_PER_BLOCK, thr_id, context_streams[stream][thr_id], context_idata[stream][thr_id], context_odata[stream][thr_id], N, LOOKUP_GAP, device_interactive[thr_id], opt_benchmark, device_texturecache[thr_id]);
-}
-
-bool cuda_prepare_keccak256(int thr_id, const uint32_t host_pdata[20], const uint32_t ptarget[8])
-{
-	return context_kernel[thr_id]->prepare_keccak256(thr_id, host_pdata, ptarget);
-}
-
-void cuda_do_keccak256(int thr_id, int stream, uint32_t *hash, uint32_t nonce, int throughput, bool do_d2h)
-{
-	uint32_t GRID_BLOCKS = context_blocks[thr_id];
-	uint32_t WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
-
-	// setup execution parameters
-	dim3  grid(WU_PER_LAUNCH/WU_PER_BLOCK, 1, 1);
-	dim3  threads(THREADS_PER_WU*WU_PER_BLOCK, 1, 1);
-
-	context_kernel[thr_id]->do_keccak256(grid, threads, thr_id, stream, hash, nonce, throughput, do_d2h);
-}
-
-bool cuda_prepare_blake256(int thr_id, const uint32_t host_pdata[20], const uint32_t ptarget[8])
-{
-	return context_kernel[thr_id]->prepare_blake256(thr_id, host_pdata, ptarget);
-}
-
-void cuda_do_blake256(int thr_id, int stream, uint32_t *hash, uint32_t nonce, int throughput, bool do_d2h)
-{
-	uint32_t GRID_BLOCKS = context_blocks[thr_id];
-	uint32_t WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
-
-	// setup execution parameters
-	dim3  grid(WU_PER_LAUNCH/WU_PER_BLOCK, 1, 1);
-	dim3  threads(THREADS_PER_WU*WU_PER_BLOCK, 1, 1);
-
-	context_kernel[thr_id]->do_blake256(grid, threads, thr_id, stream, hash, nonce, throughput, do_d2h);
+	context_kernel[thr_id]->run_kernel(grid, threads, WARPS_PER_BLOCK, thr_id,
+		context_streams[stream][thr_id], context_idata[stream][thr_id], context_odata[stream][thr_id],
+		N, LOOKUP_GAP, device_interactive[thr_id], opt_benchmark, device_texturecache[thr_id]
+	);
 }
 
 void cuda_scrypt_DtoH(int thr_id, uint32_t *X, int stream, bool postSHA)
 {
-	uint32_t GRID_BLOCKS = context_blocks[thr_id];
-	uint32_t WARPS_PER_BLOCK = context_wpb[thr_id];
-	uint32_t THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
-	uint32_t mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * (postSHA ? 8 : 32);
-
+	unsigned int GRID_BLOCKS = context_blocks[thr_id];
+	unsigned int WARPS_PER_BLOCK = context_wpb[thr_id];
+	unsigned int THREADS_PER_WU = context_kernel[thr_id]->threads_per_wu();
+	unsigned int mem_size = WU_PER_LAUNCH * sizeof(uint32_t) * (postSHA ? 8 : 32);
 	// copy result from device to host (asynchronously)
 	checkCudaErrors(cudaMemcpyAsync(X, postSHA ? context_hash[stream][thr_id] : context_odata[stream][thr_id], mem_size, cudaMemcpyDeviceToHost, context_streams[stream][thr_id]));
 }
@@ -873,8 +818,9 @@ void cuda_scrypt_DtoH(int thr_id, uint32_t *X, int stream, bool postSHA)
 bool cuda_scrypt_sync(int thr_id, int stream)
 {
 	cudaError_t err;
+	uint32_t wait_us = 0;
 
-	if(device_interactive[thr_id] && !opt_benchmark)
+	if (device_interactive[thr_id] && !opt_benchmark)
 	{
 		// For devices that also do desktop rendering or compositing, we want to free up some time slots.
 		// That requires making a pause in work submission when there is no active task on the GPU,
@@ -884,25 +830,29 @@ bool cuda_scrypt_sync(int thr_id, int stream)
 		//err = cudaDeviceSynchronize();
 
 		while((err = cudaStreamQuery(context_streams[0][thr_id])) == cudaErrorNotReady ||
-			  (err == cudaSuccess && (err = cudaStreamQuery(context_streams[1][thr_id])) == cudaErrorNotReady))
-			usleep(1000);
+			  (err == cudaSuccess && (err = cudaStreamQuery(context_streams[1][thr_id])) == cudaErrorNotReady)) {
+			usleep(50); wait_us+=50;
+		}
 
-		usleep(1000);
-	}
-	else
-	{
+		usleep(50); wait_us+=50;
+	} else {
 		// this call was replaced by the loop below to workaround the high CPU usage issue
 		//err = cudaStreamSynchronize(context_streams[stream][thr_id]);
 
-		while((err = cudaStreamQuery(context_streams[stream][thr_id])) == cudaErrorNotReady)
-			usleep(1000);
+		while((err = cudaStreamQuery(context_streams[stream][thr_id])) == cudaErrorNotReady) {
+			usleep(50); wait_us+=50;
+		}
 	}
 
-	if(err != cudaSuccess)
-	{
-		applog(LOG_ERR, "GPU #%d: CUDA error `%s` while executing the kernel.", device_map[thr_id], cudaGetErrorString(err));
+	if (err != cudaSuccess) {
+		if (!abort_flag)
+			applog(LOG_ERR, "GPU #%d: CUDA error `%s` while waiting the kernel.", device_map[thr_id], cudaGetErrorString(err));
 		return false;
 	}
+
+	//if (opt_debug) {
+	//	applog(LOG_DEBUG, "GPU #%d: %s %u us", device_map[thr_id], __FUNCTION__, wait_us);
+	//}
 
 	return true;
 }

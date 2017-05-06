@@ -8,7 +8,6 @@
  * any later version.  See COPYING for more details.
  */
 
-#include "cpuminer-config.h"
 #include "miner.h"
 
 #include <string.h>
@@ -67,10 +66,10 @@ void sha256_init(uint32_t *state)
 
 /* Adjusted round function for rotating state */
 #define RNDr(S, W, i) \
-	RND(S[(64 - i) & 7], S[(65 - i) & 7], \
-	    S[(66 - i) & 7], S[(67 - i) & 7], \
-	    S[(68 - i) & 7], S[(69 - i) & 7], \
-	    S[(70 - i) & 7], S[(71 - i) & 7], \
+	RND(S[(64 - i) % 8], S[(65 - i) % 8], \
+	    S[(66 - i) % 8], S[(67 - i) % 8], \
+	    S[(68 - i) % 8], S[(69 - i) % 8], \
+	    S[(70 - i) % 8], S[(71 - i) % 8], \
 	    W[i] + sha256_k[i])
 
 #ifndef EXTERN_SHA256
@@ -468,8 +467,8 @@ static inline void sha256d_ms(uint32_t *hash, uint32_t *W,
 void sha256d_ms_4way(uint32_t *hash,  uint32_t *data,
 	const uint32_t *midstate, const uint32_t *prehash);
 
-static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
-	const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done)
+static inline int scanhash_sha256d_4way(int thr_id,  uint32_t *pdata,
+	const uint32_t *ptarget uint32_t max_nonce, unsigned long *hashes_done)
 {
 	uint32_t data[4 * 64] __attribute__((aligned(128)));
 	uint32_t hash[4 * 8] __attribute__((aligned(32)));
@@ -508,14 +507,15 @@ static inline int scanhash_sha256d_4way(int thr_id, uint32_t *pdata,
 				pdata[19] = data[4 * 3 + i];
 				sha256d_80_swap(hash, pdata);
 				if (fulltest(hash, ptarget)) {
-					*hashes_done = n - first_nonce;
+					work_set_target_ratio(work, hash);
+					*hashes_done = n - first_nonce + 1;
 					return 1;
 				}
 			}
 		}
-	} while (n < max_nonce && !scan_abort_flag && !work_restart[thr_id].restart);
+	} while (n < max_nonce && !work_restart[thr_id].restart);
 	
-	*hashes_done = n - first_nonce;
+	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
 }
@@ -567,27 +567,29 @@ static inline int scanhash_sha256d_8way(int thr_id, uint32_t *pdata,
 				pdata[19] = data[8 * 3 + i];
 				sha256d_80_swap(hash, pdata);
 				if (fulltest(hash, ptarget)) {
-					*hashes_done = n - first_nonce;
+					*hashes_done = n - first_nonce + 1;
 					return 1;
 				}
 			}
 		}
-	} while (n < max_nonce && !scan_abort_flag && !work_restart[thr_id].restart);
+	} while (n < max_nonce && !work_restart[thr_id].restart);
 	
-	*hashes_done = n - first_nonce;
+	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
 }
 
 #endif /* HAVE_SHA256_8WAY */
 
-int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
-	uint32_t max_nonce, unsigned long *hashes_done)
+#if 0
+int scanhash_sha256d(int thr_id, struct work* work, uint32_t max_nonce, unsigned long *hashes_done)
 {
-	uint32_t data[64] /* __attribute__((aligned(128))) */;
-	uint32_t hash[8] /* __attribute__((aligned(32))) */;
-	uint32_t midstate[8] /* __attribute__((aligned(32))) */;
-	uint32_t prehash[8] /* __attribute__((aligned(32))) */;
+	uint32_t _ALIGN(128) data[64];
+	uint32_t hash[8];
+	uint32_t midstate[8];
+	uint32_t prehash[8];
+	uint32_t *pdata = work->data;
+	uint32_t *ptarget = work->target;
 	uint32_t n = pdata[19] - 1;
 	const uint32_t first_nonce = pdata[19];
 	const uint32_t Htarg = ptarget[7];
@@ -618,13 +620,15 @@ int scanhash_sha256d(int thr_id, uint32_t *pdata, const uint32_t *ptarget,
 			pdata[19] = data[3];
 			sha256d_80_swap(hash, pdata);
 			if (fulltest(hash, ptarget)) {
-				*hashes_done = n - first_nonce;
+				*hashes_done = n - first_nonce + 1;
 				return 1;
 			}
 		}
-	} while (n < max_nonce && !scan_abort_flag && !work_restart[thr_id].restart);
+	} while (n < max_nonce && !work_restart[thr_id].restart);
 	
-	*hashes_done = n - first_nonce;
+	*hashes_done = n - first_nonce + 1;
 	pdata[19] = n;
 	return 0;
 }
+
+#endif

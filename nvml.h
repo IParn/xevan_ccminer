@@ -17,20 +17,22 @@
 
 #include "miner.h"
 
+void *monitor_thread(void *userdata);
+
 typedef void * nvmlDevice_t;
 
 /* our own version of the PCI info struct */
 typedef struct {
 	char bus_id_str[16];             /* string form of bus info */
-	uint32_t domain;
-	uint32_t bus;
-	uint32_t device;
-	uint32_t pci_device_id;      /* combined device and vendor id */
-	uint32_t pci_subsystem_id;
-	uint32_t res0;               /* NVML internal use only */
-	uint32_t res1;
-	uint32_t res2;
-	uint32_t res3;
+	unsigned int domain;
+	unsigned int bus;
+	unsigned int device;
+	unsigned int pci_device_id;      /* combined device and vendor id */
+	unsigned int pci_subsystem_id;
+	unsigned int res0;               /* NVML internal use only */
+	unsigned int res1;
+	unsigned int res2;
+	unsigned int res3;
 } nvmlPciInfo_t;
 
 enum nvmlEnableState_t {
@@ -41,7 +43,7 @@ enum nvmlEnableState_t {
 
 enum nvmlRestrictedAPI_t {
 	NVML_RESTRICTED_API_SET_APPLICATION_CLOCKS = 0,
-	NVML_RESTRICTED_API_SET_AUTO_BOOSTED_CLOCKS = 1,
+	NVML_RESTRICTED_API_SET_AUTO_BOOSTED_CLOCKS = 1, // not for GTX cards
 	NVML_RESTRICTED_API_COUNT = 2
 };
 
@@ -57,14 +59,52 @@ enum nvmlReturn_t {
 	NVML_ERROR_INSUFFICIENT_POWER = 8,
 	NVML_ERROR_DRIVER_NOT_LOADED = 9,
 	NVML_ERROR_TIMEOUT = 10,
+	NVML_ERROR_IRQ_ISSUE = 11,
+	NVML_ERROR_LIBRARY_NOT_FOUND = 12,
+	NVML_ERROR_FUNCTION_NOT_FOUND = 13,
+	NVML_ERROR_CORRUPTED_INFOROM = 14,
+	NVML_ERROR_GPU_IS_LOST = 15,
+	NVML_ERROR_RESET_REQUIRED = 16,
+	NVML_ERROR_OPERATING_SYSTEM = 17,
+	NVML_ERROR_LIB_RM_VERSION_MISMATCH = 18,
+	NVML_ERROR_IN_USE = 19,
 	NVML_ERROR_UNKNOWN = 999
 };
 
 enum nvmlClockType_t {
 	NVML_CLOCK_GRAPHICS = 0,
 	NVML_CLOCK_SM = 1,
-	NVML_CLOCK_MEM = 2
+	NVML_CLOCK_MEM = 2,
+	NVML_CLOCK_VIDEO = 3,
+	NVML_CLOCK_COUNT
 };
+
+enum nvmlClockId_t {
+	NVML_CLOCK_ID_CURRENT = 0,
+	NVML_CLOCK_ID_APP_CLOCK_TARGET = 1,
+	NVML_CLOCK_ID_APP_CLOCK_DEFAULT = 2,
+	NVML_CLOCK_ID_CUSTOMER_BOOST_MAX = 3,
+	NVML_CLOCK_ID_COUNT
+};
+
+enum nvmlPcieUtilCounter_t {
+	NVML_PCIE_UTIL_TX_BYTES = 0,
+	NVML_PCIE_UTIL_RX_BYTES = 1,
+	NVML_PCIE_UTIL_COUNT
+};
+
+enum nvmlValueType_t {
+	NVML_VALUE_TYPE_DOUBLE = 0,
+	NVML_VALUE_TYPE_UNSIGNED_INT = 1,
+	NVML_VALUE_TYPE_UNSIGNED_LONG = 2,
+	NVML_VALUE_TYPE_UNSIGNED_LONG_LONG = 3,
+	NVML_VALUE_TYPE_COUNT
+};
+
+typedef int nvmlGpuTopologyLevel_t;
+typedef int nvmlNvLinkCapability_t;
+typedef int nvmlNvLinkErrorCounter_t;
+typedef int nvmlNvLinkUtilizationControl_t;
 
 #define NVML_DEVICE_SERIAL_BUFFER_SIZE 30
 #define NVML_DEVICE_UUID_BUFFER_SIZE 80
@@ -78,10 +118,10 @@ typedef struct {
 	void *nvml_dll;
 	int nvml_gpucount;
 	int cuda_gpucount;
-	uint32_t *nvml_pci_domain_id;
-	uint32_t *nvml_pci_bus_id;
-	uint32_t *nvml_pci_device_id;
-	uint32_t *nvml_pci_subsys_id;
+	unsigned int *nvml_pci_domain_id;
+	unsigned int *nvml_pci_bus_id;
+	unsigned int *nvml_pci_device_id;
+	unsigned int *nvml_pci_subsys_id;
 	int *nvml_cuda_device_id;          /* map NVML dev to CUDA dev */
 	int *cuda_nvml_device_id;          /* map CUDA dev to NVML dev */
 	nvmlDevice_t *devs;
@@ -91,92 +131,119 @@ typedef struct {
 	nvmlReturn_t (*nvmlDeviceGetHandleByIndex)(int, nvmlDevice_t *);
 	nvmlReturn_t (*nvmlDeviceGetAPIRestriction)(nvmlDevice_t, nvmlRestrictedAPI_t, nvmlEnableState_t *);
 	nvmlReturn_t (*nvmlDeviceSetAPIRestriction)(nvmlDevice_t, nvmlRestrictedAPI_t, nvmlEnableState_t);
-	nvmlReturn_t (*nvmlDeviceGetDefaultApplicationsClock)(nvmlDevice_t, nvmlClockType_t, uint32_t *);
-	nvmlReturn_t (*nvmlDeviceGetApplicationsClock)(nvmlDevice_t, nvmlClockType_t, uint32_t *);
-	nvmlReturn_t (*nvmlDeviceSetApplicationsClocks)(nvmlDevice_t, uint32_t, uint32_t);
-	nvmlReturn_t (*nvmlDeviceGetClockInfo)(nvmlDevice_t, nvmlClockType_t, uint32_t *);
+	nvmlReturn_t (*nvmlDeviceGetDefaultApplicationsClock)(nvmlDevice_t, nvmlClockType_t, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceGetApplicationsClock)(nvmlDevice_t, nvmlClockType_t, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceSetApplicationsClocks)(nvmlDevice_t, unsigned int, unsigned int);
+	nvmlReturn_t (*nvmlDeviceResetApplicationsClocks)(nvmlDevice_t);
+	nvmlReturn_t (*nvmlDeviceGetSupportedGraphicsClocks)(nvmlDevice_t, uint32_t mem, uint32_t *num, uint32_t *arr);
+	nvmlReturn_t (*nvmlDeviceGetSupportedMemoryClocks)(nvmlDevice_t, unsigned int *count, unsigned int *clocksMHz);
+	nvmlReturn_t (*nvmlDeviceGetClockInfo)(nvmlDevice_t, nvmlClockType_t, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceGetMaxClockInfo)(nvmlDevice_t, nvmlClockType_t, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceGetPowerManagementDefaultLimit)(nvmlDevice_t, unsigned int *limit);
+	nvmlReturn_t (*nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int *limit);
+	nvmlReturn_t (*nvmlDeviceGetPowerManagementLimitConstraints)(nvmlDevice_t, unsigned int *min, unsigned int *max);
+	nvmlReturn_t (*nvmlDeviceSetPowerManagementLimit)(nvmlDevice_t device, unsigned int limit);
 	nvmlReturn_t (*nvmlDeviceGetPciInfo)(nvmlDevice_t, nvmlPciInfo_t *);
+	nvmlReturn_t (*nvmlDeviceGetCurrPcieLinkGeneration)(nvmlDevice_t device, unsigned int *gen);
+	nvmlReturn_t (*nvmlDeviceGetCurrPcieLinkWidth)(nvmlDevice_t device, unsigned int *width);
+	nvmlReturn_t (*nvmlDeviceGetMaxPcieLinkGeneration)(nvmlDevice_t device, unsigned int *gen);
+	nvmlReturn_t (*nvmlDeviceGetMaxPcieLinkWidth)(nvmlDevice_t device, unsigned int *width);
 	nvmlReturn_t (*nvmlDeviceGetName)(nvmlDevice_t, char *, int);
-	nvmlReturn_t (*nvmlDeviceGetTemperature)(nvmlDevice_t, int, uint32_t *);
-	nvmlReturn_t (*nvmlDeviceGetFanSpeed)(nvmlDevice_t, uint32_t *);
+	nvmlReturn_t (*nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int *);
 	nvmlReturn_t (*nvmlDeviceGetPerformanceState)(nvmlDevice_t, int *); /* enum */
-	nvmlReturn_t (*nvmlDeviceGetPowerUsage)(nvmlDevice_t, uint32_t *);
-	nvmlReturn_t (*nvmlDeviceGetSerial)(nvmlDevice_t, char *serial, uint32_t len);
-	nvmlReturn_t (*nvmlDeviceGetUUID)(nvmlDevice_t, char *uuid, uint32_t len);
-	nvmlReturn_t (*nvmlDeviceGetVbiosVersion)(nvmlDevice_t, char *version, uint32_t len);
-	nvmlReturn_t (*nvmlSystemGetDriverVersion)(char *version, uint32_t len);
+	nvmlReturn_t (*nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int *);
+	nvmlReturn_t (*nvmlDeviceGetSerial)(nvmlDevice_t, char *serial, unsigned int len);
+	nvmlReturn_t (*nvmlDeviceGetUUID)(nvmlDevice_t, char *uuid, unsigned int len);
+	nvmlReturn_t (*nvmlDeviceGetVbiosVersion)(nvmlDevice_t, char *version, unsigned int len);
+	nvmlReturn_t (*nvmlSystemGetDriverVersion)(char *version, unsigned int len);
 	char* (*nvmlErrorString)(nvmlReturn_t);
 	nvmlReturn_t (*nvmlShutdown)(void);
-} nvml_handle;
+	// v331
+	nvmlReturn_t (*nvmlDeviceGetEnforcedPowerLimit)(nvmlDevice_t, unsigned int *limit);
+	// v340
+#ifdef __linux__
+	nvmlReturn_t (*nvmlDeviceClearCpuAffinity)(nvmlDevice_t);
+	nvmlReturn_t (*nvmlDeviceGetCpuAffinity)(nvmlDevice_t, unsigned int cpuSetSize, unsigned long* cpuSet);
+	nvmlReturn_t (*nvmlDeviceSetCpuAffinity)(nvmlDevice_t);
+#endif
+	// v346
+	nvmlReturn_t (*nvmlDeviceGetPcieThroughput)(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int *value);
+	// v36x (API 8)
+	nvmlReturn_t (*nvmlDeviceGetClock)(nvmlDevice_t, nvmlClockType_t clockType, nvmlClockId_t clockId, unsigned int *clockMHz);
+#ifdef __linux__
+	nvmlReturn_t (*nvmlSystemGetTopologyGpuSet)(unsigned int cpuNumber, unsigned int *count, nvmlDevice_t *deviceArray);
+	nvmlReturn_t (*nvmlDeviceGetTopologyNearestGpus)(nvmlDevice_t, nvmlGpuTopologyLevel_t level, unsigned int *count, nvmlDevice_t *deviceArray);
+	nvmlReturn_t (*nvmlDeviceGetTopologyCommonAncestor)(nvmlDevice_t device1, nvmlDevice_t device2, nvmlGpuTopologyLevel_t *pathInfo);
+#endif
+	nvmlReturn_t (*nvmlDeviceGetNvLinkState)(nvmlDevice_t, unsigned int link, nvmlEnableState_t *isActive);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkVersion)(nvmlDevice_t, unsigned int link, unsigned int *version);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkCapability)(nvmlDevice_t, unsigned int link, nvmlNvLinkCapability_t capability, unsigned int *capResult);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkRemotePciInfo)(nvmlDevice_t, unsigned int link, nvmlPciInfo_t *pci);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkErrorCounter)(nvmlDevice_t, unsigned int link, nvmlNvLinkErrorCounter_t counter, unsigned long long *counterValue);
+	nvmlReturn_t (*nvmlDeviceResetNvLinkErrorCounters)(nvmlDevice_t, unsigned int link);
+	nvmlReturn_t (*nvmlDeviceSetNvLinkUtilizationControl)(nvmlDevice_t, unsigned int link, unsigned int counter, nvmlNvLinkUtilizationControl_t *control, unsigned int reset);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkUtilizationControl)(nvmlDevice_t, unsigned int link, unsigned int counter, nvmlNvLinkUtilizationControl_t *control);
+	nvmlReturn_t (*nvmlDeviceGetNvLinkUtilizationCounter)(nvmlDevice_t, unsigned int link, unsigned int counter, unsigned long long *rxcounter, unsigned long long *txcounter);
+	nvmlReturn_t (*nvmlDeviceFreezeNvLinkUtilizationCounter)(nvmlDevice_t, unsigned int link, unsigned int counter, nvmlEnableState_t freeze);
+	nvmlReturn_t (*nvmlDeviceResetNvLinkUtilizationCounter)(nvmlDevice_t, unsigned int link, unsigned int counter);
 
+} nvml_handle;
 
 nvml_handle * nvml_create();
 int nvml_destroy(nvml_handle *nvmlh);
 
-/*
- * Query the number of GPUs seen by NVML
- */
+// Debug informations
+void nvml_print_device_info(int dev_id);
+
+// Query the number of GPUs seen by NVML
 int nvml_get_gpucount(nvml_handle *nvmlh, int *gpucount);
 
-/*
- * Query the number of GPUs seen by CUDA
- */
-int cuda_get_gpucount(nvml_handle *nvmlh, int *gpucount);
+int nvml_set_plimit(nvml_handle *nvmlh, int dev_id);
+int nvml_set_pstate(nvml_handle *nvmlh, int dev_id);
 
-
-/*
- * query the name of the GPU model from the CUDA device ID
- *
- */
-int nvml_get_gpu_name(nvml_handle *nvmlh,
-                           int gpuindex,
-                           char *namebuf,
-                           int bufsize);
-
-/*
- * Query the current GPU temperature (Celsius), from the CUDA device ID
- */
-int nvml_get_tempC(nvml_handle *nvmlh,
-                        int gpuindex, uint32_t *tempC);
-
-/*
- * Query the current GPU fan speed (percent) from the CUDA device ID
- */
-int nvml_get_fanpcnt(nvml_handle *nvmlh,
-                          int gpuindex, uint32_t *fanpcnt);
-                          
-/*
- * Query the current graphics and memory clocks from the CUDA device ID
- */
-int nvml_get_current_clocks(nvml_handle *nvmlh, int cudaindex, uint32_t *graphics_clock, uint32_t *mem_clock);
-
-/*
- * Query the current GPU power usage in millwatts from the CUDA device ID
- *
- * This feature is only available on recent GPU generations and may be
- * limited in some cases only to Tesla series GPUs.
- * If the query is run on an unsupported GPU, this routine will return -1.
- */
-int nvml_get_power_usage(nvml_handle *nvmlh,
-                              int gpuindex,
-                              uint32_t *milliwatts);
+int nvml_set_clocks(nvml_handle *nvmlh, int dev_id);
+int nvml_reset_clocks(nvml_handle *nvmlh, int dev_id);
 
 /* api functions */
 
-uint32_t gpu_fanpercent(struct cgpu_info *gpu);
-uint32_t gpu_fanrpm(struct cgpu_info *gpu);
+unsigned int gpu_fanpercent(struct cgpu_info *gpu);
+unsigned int gpu_fanrpm(struct cgpu_info *gpu);
 float gpu_temp(struct cgpu_info *gpu);
-uint32_t gpu_power(struct cgpu_info *gpu);
-uint32_t gpu_usage(struct cgpu_info *gpu);
+unsigned int gpu_power(struct cgpu_info *gpu);
+unsigned int gpu_plimit(struct cgpu_info *gpu);
 int gpu_pstate(struct cgpu_info *gpu);
 int gpu_busid(struct cgpu_info *gpu);
 
-/* pid/vid, sn and bios rev */
+// pid/vid, sn and bios rev
 int gpu_info(struct cgpu_info *gpu);
+
+int gpu_vendor(uint8_t pci_bus_id, char *vendorname);
 
 /* nvapi functions */
 #ifdef WIN32
 int nvapi_init();
+int nvapi_init_settings();
+
+// to debug nvapi..
+int nvapi_pstateinfo(unsigned int devNum);
+uint8_t nvapi_get_plimit(unsigned int devNum);
+
+// nvapi devNum from dev_id (cuda GPU #N)
+unsigned int nvapi_devnum(int dev_id);
+int nvapi_devid(unsigned int devNum);
+
+// cuda Replacement for 6.5 compat
+int nvapiMemGetInfo(int dev_id, uint64_t *free, uint64_t *total);
 #endif
 
 #endif /* USE_WRAPNVML */
+
+void gpu_led_on(int dev_id);
+void gpu_led_percent(int dev_id, int percent);
+void gpu_led_off(int dev_id);
+
+#define LED_MODE_OFF    0
+#define LED_MODE_SHARES 1
+#define LED_MODE_MINING 2
+

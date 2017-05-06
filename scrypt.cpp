@@ -26,6 +26,7 @@
  * This file was originally written by Colin Percival as part of the Tarsnap
  * online backup system.
  */
+
 #ifdef WIN32
 #include <ppl.h>
 using namespace Concurrency;
@@ -681,32 +682,61 @@ static inline void PBKDF2_SHA256_128_32(uint32_t *tstate, uint32_t *ostate,
 }
 
 static int lastFactor = 0;
-//
+
+static void computeGold(uint32_t* const input, uint32_t *reference, uchar *scratchpad);
+
+static bool init[MAX_GPUS] = { 0 };
+
+// cleanup
+void free_scrypt(int thr_id)
+{
+	int dev_id = device_map[thr_id];
+
+	if (!init[thr_id])
+		return;
+
+	// trivial way to free all...
+	cudaSetDevice(dev_id);
+	cudaDeviceSynchronize();
+	cudaDeviceReset();
+
+	init[thr_id] = false;
+}
+
 // Scrypt proof of work algorithm
 // using SSE2 vectorized HMAC SHA256 on CPU and
 // a salsa core implementation on GPU with CUDA
 //
-
-int scanhash_scrypt(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsigned char *scratchbuf,
-	uint32_t max_nonce, unsigned long *hashes_done, struct timeval *tv_start, struct timeval *tv_end)
+int scanhash_scrypt(int thr_id, struct work *work, uint32_t max_nonce, unsigned long *hashes_done,
+	unsigned char *scratchbuf, struct timeval *tv_start, struct timeval *tv_end)
 {
 	int result = 0;
-	int throughput = cuda_throughput(thr_id);
+	uint32_t *pdata = work->data;
+	uint32_t *ptarget = work->target;
+	static __thread int throughput = 0;
 
-	if(throughput == 0)
+	if (!init[thr_id]) {
+		int dev_id = device_map[thr_id];
+		cudaSetDevice(dev_id);
+		cudaDeviceSynchronize();
+		cudaDeviceReset();
+		cudaSetDevice(dev_id);
+
+		throughput = cuda_throughput(thr_id);
+		gpulog(LOG_INFO, thr_id, "Intensity set to %g, %u cuda threads", throughput2intensity(throughput), throughput);
+
+		init[thr_id] = true;
+	}
+
+	if (throughput == 0)
 		return -1;
-
-	cudaSetDevice(device_map[thr_id]);
-	if (!opt_cpumining) cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-	cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
-
 
 	gettimeofday(tv_start, NULL);
 
 	uint32_t n = pdata[19];
 	const uint32_t Htarg = ptarget[7];
 
-	// no default set with --cputest10
+	// no default set with --cputest
 	if (opt_nfactor == 0) opt_nfactor = 9;
 	uint32_t N = (1UL<<(opt_nfactor+1));
 	uint32_t *scratch = new uint32_t[N*32]; // scratchbuffer for CPU based validation
@@ -805,9 +835,8 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsign
 			cuda_scrypt_done(thr_id, nxt);
 
 			cuda_scrypt_DtoH(thr_id, X[nxt], nxt, false);
-			cuda_scrypt_flush(thr_id, nxt);
-
-			if(!cuda_scrypt_sync(thr_id, cur))
+			//cuda_scrypt_flush(thr_id, nxt);
+			if(!cuda_scrypt_sync(thr_id, nxt))
 			{
 				result = -1;
 				break;
@@ -861,15 +890,19 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsign
 			pre_sha256(thr_id, nxt, nonce[nxt], throughput);
 
 			cuda_scrypt_core(thr_id, nxt, N);
-			cuda_scrypt_flush(thr_id, nxt); // required here ?
+			// cuda_scrypt_flush(thr_id, nxt);
+			if (!cuda_scrypt_sync(thr_id, nxt)) {
+				printf("error\n");
+				result = -1;
+				break;
+			}
 
 			post_sha256(thr_id, nxt, throughput);
 			cuda_scrypt_done(thr_id, nxt);
 
 			cuda_scrypt_DtoH(thr_id, hash[nxt], nxt, true);
-			cuda_scrypt_flush(thr_id, nxt); // required here ?
-
-			if (!cuda_scrypt_sync(thr_id, cur)) {
+			// cuda_scrypt_flush(thr_id, nxt);
+			if (!cuda_scrypt_sync(thr_id, nxt)) {
 				printf("error\n");
 				result = -1;
 				break;
@@ -899,10 +932,11 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsign
 						if (memcmp(&hash[cur][i * 8], refhash, 32) != 0) good = false;
 					}
 
-					if (!good)
-						applog(LOG_INFO, "GPU #%d: %s result does not validate on CPU (i=%d, s=%d)!", device_map[thr_id], device_name[thr_id], i, cur);
-					else {
+					if (!good) {
+						gpulog(LOG_WARNING, thr_id, "result does not validate on CPU! (i=%d, s=%d)", i, cur);
+					} else {
 						*hashes_done = n - pdata[19];
+						work_set_target_ratio(work, refhash);
 						pdata[19] = nonce[cur] + i;
 						result = 1;
 						goto byebye;
@@ -916,7 +950,7 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsign
 		++iteration;
 
 		//printf("n=%d, thr=%d, max=%d, rest=%d\n", n, throughput, max_nonce, work_restart[thr_id].restart);
-	} while (n <= max_nonce && !scan_abort_flag && !work_restart[thr_id].restart);
+	} while (n <= max_nonce && !work_restart[thr_id].restart);
 
 	*hashes_done = n - pdata[19];
 	pdata[19] = n;
@@ -993,16 +1027,16 @@ static void xor_salsa8(uint32_t * const B, const uint32_t * const C)
 /**
  * @param X input/ouput
  * @param V scratch buffer
- * @param N factor
+ * @param N factor (def. 1024)
  */
-static void scrypt_core(uint32_t *X, uint32_t *V, int N)
+static void scrypt_core(uint32_t *X, uint32_t *V, uint32_t N)
 {
-	for (int i = 0; i < N; i++) {
+	for (uint32_t i = 0; i < N; i++) {
 		memcpy(&V[i * 32], X, 128);
 		xor_salsa8(&X[0], &X[16]);
 		xor_salsa8(&X[16], &X[0]);
 	}
-	for (int i = 0; i < N; i++) {
+	for (uint32_t i = 0; i < N; i++) {
 		uint32_t j = 32 * (X[16] & (N - 1));
 		for (uint8_t k = 0; k < 32; k++)
 			X[k] ^= V[j + k];
@@ -1017,11 +1051,11 @@ static void scrypt_core(uint32_t *X, uint32_t *V, int N)
  * @param reference  reference data, computed but preallocated
  * @param scratchpad scrypt scratchpad
  **/
-void computeGold(uint32_t* const input, uint32_t *reference, uchar *scratchpad)
+static void computeGold(uint32_t* const input, uint32_t *reference, uchar *scratchpad)
 {
 	uint32_t X[32] = { 0 };
 	uint32_t *V = (uint32_t*) scratchpad;
-	int N = (1<<(opt_nfactor+1)); // default 9 = 1024
+	uint32_t N = (1<<(opt_nfactor+1)); // default 9 = 1024
 
 	for (int k = 0; k < 32; k++)
 		X[k] = input[k];
@@ -1032,31 +1066,17 @@ void computeGold(uint32_t* const input, uint32_t *reference, uchar *scratchpad)
 		reference[k] = X[k];
 }
 
-static void scrypt_1024_1_1_256(const uint32_t *input, uint32_t *output,
-	uint32_t *midstate, unsigned char *scratchpad, int N)
-{
-	uint32_t tstate[8], ostate[8];
-	uint32_t X[32] = { 0 };
-	uint32_t *V = (uint32_t *) scratchpad;
-
-	memcpy(tstate, midstate, 32);
-	HMAC_SHA256_80_init(input, tstate, ostate);
-	PBKDF2_SHA256_80_128(tstate, ostate, input, X);
-
-	scrypt_core(X, V, N);
-
-	PBKDF2_SHA256_128_32(tstate, ostate, X, output);
-}
-
 /* cputest */
 void scrypthash(void* output, const void* input)
 {
 	uint32_t _ALIGN(64) X[32], ref[32] = { 0 }, tstate[8], ostate[8], midstate[8];
 	uint32_t _ALIGN(64) data[20];
-	uchar *scratchbuf = (uchar *) calloc(4 * 128 + 63, 1024);
+	uchar *scratchbuf;
 
 	// no default set with --cputest
 	if (opt_nfactor == 0) opt_nfactor = 9;
+
+	scratchbuf = (uchar*) calloc(4 * 128 + 63, 1UL << (opt_nfactor+1));
 
 	memcpy(data, input, 80);
 
@@ -1075,27 +1095,4 @@ void scrypthash(void* output, const void* input)
 	}
 
 	free(scratchbuf);
-}
-
-#define SCRYPT_MAX_WAYS 1
-/* cputest */
-void scrypthash2(void* output, const void* input)
-{
-	uint32_t midstate[8] = { 0 };
-	uint32_t data[SCRYPT_MAX_WAYS * 20] = { 0 };
-	uint32_t hash[SCRYPT_MAX_WAYS * 8] = { 0 };
-	uint32_t N = 1U << ((opt_nfactor ? opt_nfactor : 9) + 1); // default 1024
-
-	uchar* scratch = (uchar*) calloc(4 * 128 + 63, N); // scrypt_buffer_alloc(N);
-
-	memcpy(data, input, 80);
-
-	sha256_init(midstate);
-	sha256_transform(midstate, data, 0);
-
-	scrypt_1024_1_1_256(data, hash, midstate, scratch, N);
-
-	memcpy(output, hash, 32);
-
-	free(scratch);
 }

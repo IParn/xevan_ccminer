@@ -9,127 +9,135 @@ extern "C"
 
 #include "miner.h"
 #include "cuda_helper.h"
+#include "quark/cuda_quark.h"
 
-static uint32_t *d_hash[MAX_GPUS];
+static uint32_t *d_hash[MAX_GPUS] = { 0 };
+
+// Speicher zur Generierung der Noncevektoren für die bedingten Hashes
+static uint32_t *d_jackpotNonces[MAX_GPUS] = { 0 };
+static uint32_t *d_branch1Nonces[MAX_GPUS] = { 0 };
+static uint32_t *d_branch2Nonces[MAX_GPUS] = { 0 };
+static uint32_t *d_branch3Nonces[MAX_GPUS] = { 0 };
 
 extern void jackpot_keccak512_cpu_init(int thr_id, uint32_t threads);
 extern void jackpot_keccak512_cpu_setBlock(void *pdata, size_t inlen);
-extern void jackpot_keccak512_cpu_hash(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_hash);
-
-extern void quark_blake512_cpu_hash_64(uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash);
-
-extern void quark_groestl512_cpu_hash_64(uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash);
-
-extern void quark_jh512_cpu_hash_64(uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash);
-
-extern void quark_skein512_cpu_init(int thr_id);
-extern void quark_skein512_cpu_hash_64(uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash);
+extern void jackpot_keccak512_cpu_hash(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_hash, int order);
 
 extern void jackpot_compactTest_cpu_init(int thr_id, uint32_t threads);
-extern void jackpot_compactTest_cpu_hash_64(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *inpHashes, uint32_t *d_validNonceTable, 
-											uint32_t *d_nonces1, uint32_t *nrm1,
-											uint32_t *d_nonces2, uint32_t *nrm2);
+extern void jackpot_compactTest_cpu_free(int thr_id);
+extern void jackpot_compactTest_cpu_hash_64(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *inpHashes, uint32_t *d_validNonceTable,
+                                            uint32_t *d_nonces1, uint32_t *nrm1, uint32_t *d_nonces2, uint32_t *nrm2, int order);
 
-extern uint32_t cuda_check_hash_branch(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_inputHash);
-
-// Speicher zur Generierung der Noncevektoren für die bedingten Hashes
-static uint32_t *d_jackpotNonces[MAX_GPUS];
-static uint32_t *d_branch1Nonces[MAX_GPUS];
-static uint32_t *d_branch2Nonces[MAX_GPUS];
-static uint32_t *d_branch3Nonces[MAX_GPUS];
+extern uint32_t cuda_check_hash_branch(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_inputHash, int order);
 
 // Original jackpothash Funktion aus einem miner Quelltext
-extern "C" uint32_t jackpothash(void *state, const void *input)
+extern "C" unsigned int jackpothash(void *state, const void *input)
 {
-    sph_blake512_context     ctx_blake;
-    sph_groestl512_context   ctx_groestl;
-    sph_jh512_context        ctx_jh;
-    sph_keccak512_context    ctx_keccak;
-    sph_skein512_context     ctx_skein;
+	uint32_t hash[16];
+	unsigned int rnd;
 
-    uint32_t hash[16];
+	sph_blake512_context     ctx_blake;
+	sph_groestl512_context   ctx_groestl;
+	sph_jh512_context        ctx_jh;
+	sph_keccak512_context    ctx_keccak;
+	sph_skein512_context     ctx_skein;
 
-    sph_keccak512_init(&ctx_keccak);
-    sph_keccak512 (&ctx_keccak, input, 80);
-    sph_keccak512_close(&ctx_keccak, hash);
+	sph_keccak512_init(&ctx_keccak);
+	sph_keccak512 (&ctx_keccak, input, 80);
+	sph_keccak512_close(&ctx_keccak, hash);
 
-    uint32_t round;
-    for (round = 0; round < 3; round++) {
-        if (hash[0] & 0x01) {
-           sph_groestl512_init(&ctx_groestl);
-           sph_groestl512 (&ctx_groestl, (&hash), 64);
-           sph_groestl512_close(&ctx_groestl, (&hash));
-        }
-        else {
-           sph_skein512_init(&ctx_skein);
-           sph_skein512 (&ctx_skein, (&hash), 64);
-           sph_skein512_close(&ctx_skein, (&hash));
-        }
-        if (hash[0] & 0x01) {
-           sph_blake512_init(&ctx_blake);
-           sph_blake512 (&ctx_blake, (&hash), 64);
-           sph_blake512_close(&ctx_blake, (&hash));
-        }
-        else {
-           sph_jh512_init(&ctx_jh);
-           sph_jh512 (&ctx_jh, (&hash), 64);
-           sph_jh512_close(&ctx_jh, (&hash));
-        }
-    }
-    memcpy(state, hash, 32);
+	for (rnd = 0; rnd < 3; rnd++)
+	{
+		if (hash[0] & 0x01) {
+			sph_groestl512_init(&ctx_groestl);
+			sph_groestl512 (&ctx_groestl, (&hash), 64);
+			sph_groestl512_close(&ctx_groestl, (&hash));
+		}
+		else {
+			sph_skein512_init(&ctx_skein);
+			sph_skein512 (&ctx_skein, (&hash), 64);
+			sph_skein512_close(&ctx_skein, (&hash));
+		}
 
-    return round;
+		if (hash[0] & 0x01) {
+			sph_blake512_init(&ctx_blake);
+			sph_blake512 (&ctx_blake, (&hash), 64);
+			sph_blake512_close(&ctx_blake, (&hash));
+		}
+		else {
+			sph_jh512_init(&ctx_jh);
+			sph_jh512 (&ctx_jh, (&hash), 64);
+			sph_jh512_close(&ctx_jh, (&hash));
+		}
+	}
+	memcpy(state, hash, 32);
+
+	return rnd;
 }
 
 static bool init[MAX_GPUS] = { 0 };
 
-extern "C" int scanhash_jackpot(int thr_id, uint32_t *pdata,
-    const uint32_t *ptarget, uint32_t max_nonce,
-    unsigned long *hashes_done)
+extern "C" int scanhash_jackpot(int thr_id, struct work *work, uint32_t max_nonce, unsigned long *hashes_done)
 {
+	uint32_t _ALIGN(64) endiandata[22];
+	uint32_t *pdata = work->data;
+	uint32_t *ptarget = work->target;
 	const uint32_t first_nonce = pdata[19];
+	int dev_id = device_map[thr_id];
 
-	uint32_t throughput = device_intensity(device_map[thr_id], __func__, 1U << 20);
-	throughput = min(throughput, (max_nonce - first_nonce));
+	uint32_t throughput =  cuda_default_throughput(thr_id, 1U << 20);
+	if (init[thr_id]) throughput = min(throughput, max_nonce - first_nonce);
 
 	if (opt_benchmark)
-		((uint32_t*)ptarget)[7] = 0x000f;
+		ptarget[7] = 0x000f;
 
 	if (!init[thr_id])
 	{
-		CUDA_CALL_OR_RET_X(cudaSetDevice(device_map[thr_id]), 0);
-		if (!opt_cpumining) cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-		if (opt_n_gputhreads == 1)
-		{
-			cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+		cudaSetDevice(dev_id);
+		if (opt_cudaschedule == -1 && gpu_threads == 1) {
+			cudaDeviceReset();
+			// reduce cpu usage
+			cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+			CUDA_LOG_ERROR();
 		}
+		cuda_get_arch(thr_id);
+		if (device_sm[dev_id] < 300 || cuda_arch[dev_id] < 300) {
+			gpulog(LOG_ERR, thr_id, "Sorry, This algo is not supported by this GPU arch (SM 3.0 required)");
+			proper_exit(EXIT_CODE_CUDA_ERROR);
+		}
+		gpulog(LOG_INFO, thr_id, "Intensity set to %g, %u cuda threads", throughput2intensity(throughput), throughput);
 
-		CUDA_SAFE_CALL(cudaMalloc(&d_hash[thr_id], 16 * sizeof(uint32_t) * throughput));
+		CUDA_SAFE_CALL(cudaMalloc(&d_hash[thr_id], (size_t) 64 * throughput));
 
 		jackpot_keccak512_cpu_init(thr_id, throughput);
 		jackpot_compactTest_cpu_init(thr_id, throughput);
-		quark_skein512_cpu_init(thr_id);
+		quark_blake512_cpu_init(thr_id, throughput);
+		quark_groestl512_cpu_init(thr_id, throughput);
+		quark_jh512_cpu_init(thr_id, throughput);
+		quark_skein512_cpu_init(thr_id, throughput);
+
 		cuda_check_cpu_init(thr_id, throughput);
 
-		cudaMalloc(&d_branch1Nonces[thr_id], sizeof(uint32_t)*throughput*2);
-		cudaMalloc(&d_branch2Nonces[thr_id], sizeof(uint32_t)*throughput*2);
-		cudaMalloc(&d_branch3Nonces[thr_id], sizeof(uint32_t)*throughput*2);
+		cudaMalloc(&d_branch1Nonces[thr_id], (size_t) sizeof(uint32_t)*throughput*2);
+		cudaMalloc(&d_branch2Nonces[thr_id], (size_t) sizeof(uint32_t)*throughput*2);
+		cudaMalloc(&d_branch3Nonces[thr_id], (size_t) sizeof(uint32_t)*throughput*2);
 
-		CUDA_SAFE_CALL(cudaMalloc(&d_jackpotNonces[thr_id], sizeof(uint32_t)*throughput*2));
+		CUDA_SAFE_CALL(cudaMalloc(&d_jackpotNonces[thr_id], (size_t) sizeof(uint32_t)*throughput*2));
 
 		init[thr_id] = true;
 	}
 
-	uint32_t endiandata[22];
 	for (int k=0; k < 22; k++)
-		be32enc(&endiandata[k], ((uint32_t*)pdata)[k]);
+		be32enc(&endiandata[k], pdata[k]);
 
 	jackpot_keccak512_cpu_setBlock((void*)endiandata, 80);
 	cuda_check_cpu_setTarget(ptarget);
 
 	do {
+		int order = 0;
+
 		// erstes Keccak512 Hash mit CUDA
-		jackpot_keccak512_cpu_hash(thr_id, throughput, pdata[19], d_hash[thr_id]);
+		jackpot_keccak512_cpu_hash(thr_id, throughput, pdata[19], d_hash[thr_id], order++);
 
 		uint32_t nrm1, nrm2, nrm3;
 
@@ -137,19 +145,21 @@ extern "C" int scanhash_jackpot(int thr_id, uint32_t *pdata,
 
 		jackpot_compactTest_cpu_hash_64(thr_id, throughput, pdata[19], d_hash[thr_id], NULL,
 				d_branch1Nonces[thr_id], &nrm1,
-				d_branch3Nonces[thr_id], &nrm3);
+				d_branch3Nonces[thr_id], &nrm3,
+				order++);
 
 		// verfolge den skein-pfad weiter
-		quark_skein512_cpu_hash_64(nrm3, pdata[19], d_branch3Nonces[thr_id], d_hash[thr_id]);
+		quark_skein512_cpu_hash_64(thr_id, nrm3, pdata[19], d_branch3Nonces[thr_id], d_hash[thr_id], order++);
 
 		// noch schnell Blake & JH
 		jackpot_compactTest_cpu_hash_64(thr_id, nrm3, pdata[19], d_hash[thr_id], d_branch3Nonces[thr_id],
 			d_branch1Nonces[thr_id], &nrm1,
-			d_branch2Nonces[thr_id], &nrm2);
+			d_branch2Nonces[thr_id], &nrm2,
+			order++);
 
 		if (nrm1+nrm2 == nrm3) {
-			quark_blake512_cpu_hash_64(nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id]);
-			quark_jh512_cpu_hash_64( nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id]);
+			quark_blake512_cpu_hash_64(thr_id, nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id], order++);
+			quark_jh512_cpu_hash_64(thr_id, nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id], order++);
 		}
 
 		// Runde 3 (komplett)
@@ -157,21 +167,23 @@ extern "C" int scanhash_jackpot(int thr_id, uint32_t *pdata,
 		// jackpotNonces in branch1/2 aufsplitten gemäss if (hash[0] & 0x01)
 		jackpot_compactTest_cpu_hash_64(thr_id, nrm3, pdata[19], d_hash[thr_id], d_branch3Nonces[thr_id],
 			d_branch1Nonces[thr_id], &nrm1,
-			d_branch2Nonces[thr_id], &nrm2);
+			d_branch2Nonces[thr_id], &nrm2,
+			order++);
 
 		if (nrm1+nrm2 == nrm3) {
-			quark_groestl512_cpu_hash_64(nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id]);
-			quark_skein512_cpu_hash_64(nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id]);
+			quark_groestl512_cpu_hash_64(thr_id, nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id], order++);
+			quark_skein512_cpu_hash_64(thr_id, nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id], order++);
 		}
 
 		// jackpotNonces in branch1/2 aufsplitten gemäss if (hash[0] & 0x01)
 		jackpot_compactTest_cpu_hash_64(thr_id, nrm3, pdata[19], d_hash[thr_id], d_branch3Nonces[thr_id],
 			d_branch1Nonces[thr_id], &nrm1,
-			d_branch2Nonces[thr_id], &nrm2);
+			d_branch2Nonces[thr_id], &nrm2,
+			order++);
 
 		if (nrm1+nrm2 == nrm3) {
-			quark_blake512_cpu_hash_64(nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id]);
-			quark_jh512_cpu_hash_64(nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id]);
+			quark_blake512_cpu_hash_64(thr_id, nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id], order++);
+			quark_jh512_cpu_hash_64(thr_id, nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id], order++);
 		}
 
 		// Runde 3 (komplett)
@@ -179,53 +191,107 @@ extern "C" int scanhash_jackpot(int thr_id, uint32_t *pdata,
 		// jackpotNonces in branch1/2 aufsplitten gemäss if (hash[0] & 0x01)
 		jackpot_compactTest_cpu_hash_64(thr_id, nrm3, pdata[19], d_hash[thr_id], d_branch3Nonces[thr_id],
 			d_branch1Nonces[thr_id], &nrm1,
-			d_branch2Nonces[thr_id], &nrm2);
+			d_branch2Nonces[thr_id], &nrm2,
+			order++);
 
 		if (nrm1+nrm2 == nrm3) {
-			quark_groestl512_cpu_hash_64(nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id]);
-			quark_skein512_cpu_hash_64(nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id]);
+			quark_groestl512_cpu_hash_64(thr_id, nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id], order++);
+			quark_skein512_cpu_hash_64(thr_id, nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id], order++);
 		}
 
 		// jackpotNonces in branch1/2 aufsplitten gemäss if (hash[0] & 0x01)
 		jackpot_compactTest_cpu_hash_64(thr_id, nrm3, pdata[19], d_hash[thr_id], d_branch3Nonces[thr_id],
 			d_branch1Nonces[thr_id], &nrm1,
-			d_branch2Nonces[thr_id], &nrm2);
+			d_branch2Nonces[thr_id], &nrm2,
+			order++);
 
 		if (nrm1+nrm2 == nrm3) {
-			quark_blake512_cpu_hash_64(nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id]);
-			quark_jh512_cpu_hash_64(nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id]);
+			quark_blake512_cpu_hash_64(thr_id, nrm1, pdata[19], d_branch1Nonces[thr_id], d_hash[thr_id], order++);
+			quark_jh512_cpu_hash_64(thr_id, nrm2, pdata[19], d_branch2Nonces[thr_id], d_hash[thr_id], order++);
 		}
 
-		uint32_t foundNonce = cuda_check_hash_branch(thr_id, nrm3, pdata[19], d_branch3Nonces[thr_id], d_hash[thr_id]);
-		if  (foundNonce != 0xffffffff)
+		*hashes_done = pdata[19] - first_nonce + throughput;
+
+		CUDA_LOG_ERROR();
+
+		work->nonces[0] = cuda_check_hash_branch(thr_id, nrm3, pdata[19], d_branch3Nonces[thr_id], d_hash[thr_id], order++);
+
+		if (work->nonces[0] != UINT32_MAX)
 		{
-			uint32_t rounds;
-			uint32_t vhash64[8];
-			uint32_t Htarg = ptarget[7];
-			be32enc(&endiandata[19], foundNonce);
+			const uint32_t Htarg = ptarget[7];
+			uint32_t _ALIGN(64) vhash[8];
+			be32enc(&endiandata[19], work->nonces[0]);
 
-			// diese jackpothash Funktion gibt die Zahl der Runden zurück
-			rounds = jackpothash(vhash64, endiandata);
+			// jackpothash function gibt die Zahl der Runden zurück
+			jackpothash(vhash, endiandata);
 
-			if (vhash64[7] <= Htarg && fulltest(vhash64, ptarget)) {
-				int res = 1;
-				uint32_t secNonce = cuda_check_hash_suppl(thr_id, throughput, pdata[19], d_hash[thr_id], foundNonce);
-				*hashes_done = pdata[19] - first_nonce + throughput;
-				if (secNonce != 0) {
-					pdata[21] = secNonce;
-					res++;
+			if (vhash[7] <= ptarget[7] && fulltest(vhash, ptarget)) {
+				work->valid_nonces = 1;
+				work_set_target_ratio(work, vhash);
+#if 0
+				work->nonces[1] = cuda_check_hash_suppl(thr_id, throughput, pdata[19], d_hash[thr_id], 1);
+				if (work->nonces[1] != 0) {
+					be32enc(&endiandata[19], work->nonces[1]);
+					jackpothash(vhash, endiandata);
+					bn_set_target_ratio(work, vhash, 1);
+					work->valid_nonces++;
+					pdata[19] = max(work->nonces[0], work->nonces[1]) + 1;
+				} else {
+					pdata[19] = work->nonces[0] + 1; // cursor
 				}
-				pdata[19] = foundNonce;
-				return res;
+#else
+				pdata[19] = work->nonces[0] + 1; // cursor
+#endif
+				return work->valid_nonces;
 			}
-			else {
-				applog(LOG_INFO, "GPU #%d: result for nonce $%08X does not validate on CPU (%d rounds)!", thr_id, foundNonce, rounds);
+			else if (vhash[7] > Htarg) {
+				gpu_increment_reject(thr_id);
+				if (!opt_quiet)
+					gpulog(LOG_WARNING, thr_id, "result for %08x does not validate on CPU!", work->nonces[0]);
+				pdata[19] = work->nonces[0] + 1;
+				continue;
 			}
+		}
+
+		if ((uint64_t) throughput + pdata[19] >= max_nonce) {
+			pdata[19] = max_nonce;
+			break;
 		}
 
 		pdata[19] += throughput;
-	} while (!scan_abort_flag && !work_restart[thr_id].restart && ((uint64_t)max_nonce > ((uint64_t)(pdata[19]) + (uint64_t)throughput)));
+
+	} while (!work_restart[thr_id].restart);
 
 	*hashes_done = pdata[19] - first_nonce;
+
+	CUDA_LOG_ERROR();
+
 	return 0;
+}
+
+// cleanup
+extern "C" void free_jackpot(int thr_id)
+{
+	if (!init[thr_id])
+		return;
+
+	cudaThreadSynchronize();
+
+	cudaFree(d_branch1Nonces[thr_id]);
+	cudaFree(d_branch2Nonces[thr_id]);
+	cudaFree(d_branch3Nonces[thr_id]);
+	cudaFree(d_jackpotNonces[thr_id]);
+
+	quark_blake512_cpu_free(thr_id);
+	quark_groestl512_cpu_free(thr_id);
+	jackpot_compactTest_cpu_free(thr_id);
+
+	cudaFree(d_hash[thr_id]);
+
+	cuda_check_cpu_free(thr_id);
+	CUDA_LOG_ERROR();
+
+	cudaDeviceSynchronize();
+
+	init[thr_id] = false;
 }

@@ -4,39 +4,29 @@
 // The keccak512 (SHA-3) is used in the PBKDF2 for scrypt-jane coins
 // in place of the SHA2 based PBKDF2 used in scrypt coins.
 //
-// The keccak256 is used exclusively in Maxcoin and clones. This module
-// holds the generic "default" implementation when no architecture
-// specific implementation is available in the kernel.
-//
-// NOTE: compile this .cu module for compute_10,sm_10 with --maxrregcount=64
+// NOTE: compile this .cu module for compute_20,sm_20 with --maxrregcount=64
 //
 
 #include <map>
-#include <stdint.h>
 
-#include "salsa_kernel.h"
-#include "cuda_runtime.h"
 #include "miner.h"
+#include "cuda_helper.h"
 
 #include "keccak.h"
+#include "salsa_kernel.h"
 
 // define some error checking macros
-#undef checkCudaErrors
-
-#if WIN32
 #define DELIMITER '/'
-#else
-#define DELIMITER '/'
-#endif
 #define __FILENAME__ ( strrchr(__FILE__, DELIMITER) != NULL ? strrchr(__FILE__, DELIMITER)+1 : __FILE__ )
 
+#undef checkCudaErrors
 #define checkCudaErrors(x) \
 { \
 	cudaGetLastError(); \
 	x; \
 	cudaError_t err = cudaGetLastError(); \
-	if (err != cudaSuccess) \
-		applog(LOG_ERR, "GPU #%d: cudaError %d (%s) calling '%s' (%s line %d)\n", device_map[thr_id], err, cudaGetErrorString(err), #x, __FILENAME__, __LINE__); \
+	if (err != cudaSuccess && !abort_flag) \
+		applog(LOG_ERR, "GPU #%d: cudaError %d (%s) (%s line %d)\n", device_map[thr_id], err, cudaGetErrorString(err), __FILENAME__, __LINE__); \
 }
 
 // from salsa_kernel.cu
@@ -45,7 +35,9 @@ extern std::map<int, uint32_t *> context_odata[2];
 extern std::map<int, cudaStream_t> context_streams[2];
 extern std::map<int, uint32_t *> context_hash[2];
 
+#ifndef ROTL64
 #define ROTL64(a,b) (((a) << (b)) | ((a) >> (64 - b)))
+#endif
 
 // CB
 #define U32TO64_LE(p) \
@@ -120,19 +112,19 @@ static const uint64_t host_keccak_round_constants[24] = {
 };
 
 __constant__ uint64_t c_keccak_round_constants[24];
-__constant__ uint32_t pdata[20];
+__constant__ uint32_t c_data[20];
 
 __device__
-void keccak_block(keccak_hash_state *S, const uint32_t *in) {
-	size_t i;
+void keccak_block(keccak_hash_state *S, const uint32_t *in)
+{
 	uint64_t *s = S->state, t[5], u[5], v, w;
 
 	/* absorb input */
 	#pragma unroll 9
-	for (i = 0; i < 72 / 8; i++, in += 2)
+	for (int i = 0; i < 72 / 8; i++, in += 2)
 		s[i] ^= U32TO64_LE(in);
 
-	for (i = 0; i < 24; i++) {
+	for (int i = 0; i < 24; i++) {
 		/* theta: c = a[0,i] ^ a[1,i] ^ .. a[4,i] */
 		t[0] = s[0] ^ s[5] ^ s[10] ^ s[15] ^ s[20];
 		t[1] = s[1] ^ s[6] ^ s[11] ^ s[16] ^ s[21];
@@ -194,8 +186,9 @@ void keccak_block(keccak_hash_state *S, const uint32_t *in) {
 }
 
 __device__
-void keccak_hash_init(keccak_hash_state *S) {
-#pragma unroll 25
+void keccak_hash_init(keccak_hash_state *S)
+{
+	#pragma unroll 25
 	for (int i=0; i<25; ++i)
 		S->state[i] = 0ULL;
 }
@@ -226,50 +219,62 @@ __device__ void keccak_hash_update64(keccak_hash_state *S, const uint32_t *in) {
 	mycpy64(S->buffer, in);
 }
 
-__device__ void keccak_hash_finish8(keccak_hash_state *S, uint32_t *hash) {
+__device__
+void keccak_hash_finish8(keccak_hash_state *S, uint32_t *hash)
+{
 	S->buffer[8/4] = 0x01;
-#pragma unroll 15
+	#pragma unroll 15
 	for (int i=8/4+1; i < 72/4; ++i) S->buffer[i] = 0;
-	S->buffer[72/4 - 1] |= 0x80000000;
+	S->buffer[72/4 - 1] |= 0x80000000U;
 	keccak_block(S, (const uint32_t*)S->buffer);
-#pragma unroll 8
-	for (size_t i = 0; i < 64; i += 8) {
+
+	#pragma unroll 8
+	for (int i = 0; i < 64; i += 8) {
 		U64TO32_LE((&hash[i/4]), S->state[i / 8]);
 	}
 }
 
-__device__ void keccak_hash_finish12(keccak_hash_state *S, uint32_t *hash) {
+__device__
+void keccak_hash_finish12(keccak_hash_state *S, uint32_t *hash)
+{
 	S->buffer[12/4] = 0x01;
-#pragma unroll 14
+	#pragma unroll 14
 	for (int i=12/4+1; i < 72/4; ++i) S->buffer[i] = 0;
-	S->buffer[72/4 - 1] |= 0x80000000;
+	S->buffer[72/4 - 1] |= 0x80000000U;
 	keccak_block(S, (const uint32_t*)S->buffer);
-#pragma unroll 8
-	for (size_t i = 0; i < 64; i += 8) {
+
+	#pragma unroll 8
+	for (int i = 0; i < 64; i += 8) {
 		U64TO32_LE((&hash[i/4]), S->state[i / 8]);
 	}
 }
 
-__device__ void keccak_hash_finish60(keccak_hash_state *S, uint32_t *hash) {
+__device__
+void keccak_hash_finish60(keccak_hash_state *S, uint32_t *hash)
+{
 	S->buffer[60/4] = 0x01;
-#pragma unroll 2
+	#pragma unroll
 	for (int i=60/4+1; i < 72/4; ++i) S->buffer[i] = 0;
-	S->buffer[72/4 - 1] |= 0x80000000;
+	S->buffer[72/4 - 1] |= 0x80000000U;
 	keccak_block(S, (const uint32_t*)S->buffer);
-#pragma unroll 8
-	for (size_t i = 0; i < 64; i += 8) {
+
+	#pragma unroll 8
+	for (int i = 0; i < 64; i += 8) {
 		U64TO32_LE((&hash[i/4]), S->state[i / 8]);
 	}
 }
 
-__device__ void keccak_hash_finish64(keccak_hash_state *S, uint32_t *hash) {
+__device__
+void keccak_hash_finish64(keccak_hash_state *S, uint32_t *hash)
+{
 	S->buffer[64/4] = 0x01;
-#pragma unroll 1
+	#pragma unroll
 	for (int i=64/4+1; i < 72/4; ++i) S->buffer[i] = 0;
-	S->buffer[72/4 - 1] |= 0x80000000;
+	S->buffer[72/4 - 1] |= 0x80000000U;
 	keccak_block(S, (const uint32_t*)S->buffer);
-#pragma unroll 8
-	for (size_t i = 0; i < 64; i += 8) {
+
+	#pragma unroll 8
+	for (int i = 0; i < 64; i += 8) {
 		U64TO32_LE((&hash[i/4]), S->state[i / 8]);
 	}
 }
@@ -283,7 +288,8 @@ typedef struct pbkdf2_hmac_state_t {
 } pbkdf2_hmac_state;
 
 
-__device__ void pbkdf2_hash(uint32_t *hash, const uint32_t *m) {
+__device__ void pbkdf2_hash(uint32_t *hash, const uint32_t *m)
+{
 	keccak_hash_state st;
 	keccak_hash_init(&st);
 	keccak_hash_update72(&st, m);
@@ -292,32 +298,32 @@ __device__ void pbkdf2_hash(uint32_t *hash, const uint32_t *m) {
 }
 
 /* hmac */
-__device__ void pbkdf2_hmac_init80(pbkdf2_hmac_state *st, const uint32_t *key) {
-	uint32_t pad[72/4];
-	size_t i;
+__device__
+void pbkdf2_hmac_init80(pbkdf2_hmac_state *st, const uint32_t *key)
+{
+	uint32_t pad[72/4] = { 0 };
+	//#pragma unroll 18
+	//for (int i = 0; i < 72/4; i++)
+	//	pad[i] = 0;
 
 	keccak_hash_init(&st->inner);
 	keccak_hash_init(&st->outer);
-
-#pragma unroll 18
-	for (i = 0; i < 72/4; i++)
-		pad[i] = 0;
 
 	/* key > blocksize bytes, hash it */
 	pbkdf2_hash(pad, key);
 
 	/* inner = (key ^ 0x36) */
 	/* h(inner || ...) */
-#pragma unroll 18
-	for (i = 0; i < 72/4; i++)
-		pad[i] ^= 0x36363636;
+	#pragma unroll 18
+	for (int i = 0; i < 72/4; i++)
+		pad[i] ^= 0x36363636U;
 	keccak_hash_update72(&st->inner, pad);
 
 	/* outer = (key ^ 0x5c) */
 	/* h(outer || ...) */
-#pragma unroll 18
-	for (i = 0; i < 72/4; i++)
-		pad[i] ^= 0x6a6a6a6a;
+	#pragma unroll 18
+	for (int i = 0; i < 72/4; i++)
+		pad[i] ^= 0x6a6a6a6aU;
 	keccak_hash_update72(&st->outer, pad);
 }
 
@@ -375,29 +381,23 @@ __device__ void pbkdf2_statecopy8(pbkdf2_hmac_state *d, pbkdf2_hmac_state *s) {
 
 // ---------------------------- END PBKDF2 functions ------------------------------------
 
-static __device__ uint32_t cuda_swab32(uint32_t x) {
-	return (((x << 24) & 0xff000000u) | ((x << 8) & 0x00ff0000u)
-		  | ((x >> 8) & 0x0000ff00u) | ((x >> 24) & 0x000000ffu));
-}
-
 __global__ __launch_bounds__(128)
 void cuda_pre_keccak512(uint32_t *g_idata, uint32_t nonce)
 {
-	nonce        +=       (blockIdx.x * blockDim.x) + threadIdx.x;
-	g_idata      += 32 * ((blockIdx.x * blockDim.x) + threadIdx.x);
-
 	uint32_t data[20];
 
+	const uint32_t thread = (blockIdx.x * blockDim.x) + threadIdx.x;
+	nonce   += thread;
+	g_idata += thread * 32;
+
 	#pragma unroll
-	for (int i=0; i <19; ++i)
-		data[i] = cuda_swab32(pdata[i]);
+	for (int i=0; i<19; i++)
+		data[i] = cuda_swab32(c_data[i]);
 	data[19] = cuda_swab32(nonce);
 
 //    scrypt_pbkdf2_1((const uint8_t*)data, 80, (const uint8_t*)data, 80, (uint8_t*)g_idata, 128);
 
-	pbkdf2_hmac_state hmac_pw, work;
-	uint32_t ti[16];
-	uint32_t be;
+	pbkdf2_hmac_state hmac_pw;
 
 	/* hmac(password, ...) */
 	pbkdf2_hmac_init80(&hmac_pw, data);
@@ -406,14 +406,17 @@ void cuda_pre_keccak512(uint32_t *g_idata, uint32_t nonce)
 	pbkdf2_hmac_update72(&hmac_pw, data);
 	pbkdf2_hmac_update8(&hmac_pw, data+72/4);
 
+	pbkdf2_hmac_state work;
+	uint32_t ti[16];
+
 	/* U1 = hmac(password, salt || be(i)) */
-	be = cuda_swab32(1);
+	uint32_t be = 0x01000000U;//cuda_swab32(1);
 	pbkdf2_statecopy8(&work, &hmac_pw);
 	pbkdf2_hmac_update4_8(&work, &be);
 	pbkdf2_hmac_finish12(&work, ti);
 	mycpy64(g_idata, ti);
 
-	be = cuda_swab32(2);
+	be = 0x02000000U;//cuda_swab32(2);
 	pbkdf2_statecopy8(&work, &hmac_pw);
 	pbkdf2_hmac_update4_8(&work, &be);
 	pbkdf2_hmac_finish12(&work, ti);
@@ -424,22 +427,21 @@ void cuda_pre_keccak512(uint32_t *g_idata, uint32_t nonce)
 __global__ __launch_bounds__(128)
 void cuda_post_keccak512(uint32_t *g_odata, uint32_t *g_hash, uint32_t nonce)
 {
-	nonce        +=       (blockIdx.x * blockDim.x) + threadIdx.x;
-	g_odata      += 32 * ((blockIdx.x * blockDim.x) + threadIdx.x);
-	g_hash       +=  8 * ((blockIdx.x * blockDim.x) + threadIdx.x);
-
 	uint32_t data[20];
 
-#pragma unroll 19
-	for (int i=0; i <19; ++i)
-		data[i] = cuda_swab32(pdata[i]);
+	const uint32_t thread = (blockIdx.x * blockDim.x) + threadIdx.x;
+	g_hash  += thread * 8;
+	g_odata += thread * 32;
+	nonce   += thread;
+
+	#pragma unroll
+	for (int i=0; i<19; i++)
+		data[i] = cuda_swab32(c_data[i]);
 	data[19] = cuda_swab32(nonce);
 
 //	scrypt_pbkdf2_1((const uint8_t*)data, 80, (const uint8_t*)g_odata, 128, (uint8_t*)g_hash, 32);
 
 	pbkdf2_hmac_state hmac_pw;
-	uint32_t ti[16];
-	uint32_t be;
 
 	/* hmac(password, ...) */
 	pbkdf2_hmac_init80(&hmac_pw, data);
@@ -448,8 +450,10 @@ void cuda_post_keccak512(uint32_t *g_odata, uint32_t *g_hash, uint32_t nonce)
 	pbkdf2_hmac_update72(&hmac_pw, g_odata);
 	pbkdf2_hmac_update56(&hmac_pw, g_odata+72/4);
 
+	uint32_t ti[16];
+
 	/* U1 = hmac(password, salt || be(i)) */
-	be = cuda_swab32(1);
+	uint32_t be = 0x01000000U;//cuda_swab32(1);
 	pbkdf2_hmac_update4_56(&hmac_pw, &be);
 	pbkdf2_hmac_finish60(&hmac_pw, ti);
 	mycpy32(g_hash, ti);
@@ -459,16 +463,16 @@ void cuda_post_keccak512(uint32_t *g_odata, uint32_t *g_hash, uint32_t nonce)
 // callable host code to initialize constants and to call kernels
 //
 
-static bool init[MAX_GPUS] = { 0 };
-
 extern "C" void prepare_keccak512(int thr_id, const uint32_t host_pdata[20])
 {
+	static bool init[MAX_GPUS] = { 0 };
+
 	if (!init[thr_id])
 	{
 		checkCudaErrors(cudaMemcpyToSymbol(c_keccak_round_constants, host_keccak_round_constants, sizeof(host_keccak_round_constants), 0, cudaMemcpyHostToDevice));
 		init[thr_id] = true;
 	}
-	checkCudaErrors(cudaMemcpyToSymbol(pdata, host_pdata, 20*sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
+	checkCudaErrors(cudaMemcpyToSymbol(c_data, host_pdata, 20*sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
 }
 
 extern "C" void pre_keccak512(int thr_id, int stream, uint32_t nonce, int throughput)
@@ -485,353 +489,4 @@ extern "C" void post_keccak512(int thr_id, int stream, uint32_t nonce, int throu
 	dim3 grid((throughput+127)/128);
 
 	cuda_post_keccak512<<<grid, block, 0, context_streams[stream][thr_id]>>>(context_odata[stream][thr_id], context_hash[stream][thr_id], nonce);
-}
-
-
-//
-// Maxcoin related Keccak implementation (Keccak256)
-//
-
-#include <stdint.h>
-
-#include <map>
-extern std::map<int, int> context_blocks;
-extern std::map<int, int> context_wpb;
-extern std::map<int, KernelInterface *> context_kernel;
-
-__constant__ uint64_t ptarget64[4];
-
-#define ROL(a, offset) ((((uint64_t)a) << ((offset) % 64)) ^ (((uint64_t)a) >> (64-((offset) % 64))))
-#define ROL_mult8(a, offset) ROL(a, offset)
-
-__constant__ uint64_t KeccakF_RoundConstants[24];
-
-static uint64_t host_KeccakF_RoundConstants[24] = {
-	(uint64_t)0x0000000000000001ULL,
-	(uint64_t)0x0000000000008082ULL,
-	(uint64_t)0x800000000000808aULL,
-	(uint64_t)0x8000000080008000ULL,
-	(uint64_t)0x000000000000808bULL,
-	(uint64_t)0x0000000080000001ULL,
-	(uint64_t)0x8000000080008081ULL,
-	(uint64_t)0x8000000000008009ULL,
-	(uint64_t)0x000000000000008aULL,
-	(uint64_t)0x0000000000000088ULL,
-	(uint64_t)0x0000000080008009ULL,
-	(uint64_t)0x000000008000000aULL,
-	(uint64_t)0x000000008000808bULL,
-	(uint64_t)0x800000000000008bULL,
-	(uint64_t)0x8000000000008089ULL,
-	(uint64_t)0x8000000000008003ULL,
-	(uint64_t)0x8000000000008002ULL,
-	(uint64_t)0x8000000000000080ULL,
-	(uint64_t)0x000000000000800aULL,
-	(uint64_t)0x800000008000000aULL,
-	(uint64_t)0x8000000080008081ULL,
-	(uint64_t)0x8000000000008080ULL,
-	(uint64_t)0x0000000080000001ULL,
-	(uint64_t)0x8000000080008008ULL
-};
-
-__constant__ uint64_t pdata64[10];
-
-__global__
-void crypto_hash(uint64_t *g_out, uint32_t nonce, uint32_t *g_good, bool validate)
-{
-	uint64_t Aba, Abe, Abi, Abo, Abu;
-	uint64_t Aga, Age, Agi, Ago, Agu;
-	uint64_t Aka, Ake, Aki, Ako, Aku;
-	uint64_t Ama, Ame, Ami, Amo, Amu;
-	uint64_t Asa, Ase, Asi, Aso, Asu;
-	uint64_t BCa, BCe, BCi, BCo, BCu;
-	uint64_t Da, De, Di, Do, Du;
-	uint64_t Eba, Ebe, Ebi, Ebo, Ebu;
-	uint64_t Ega, Ege, Egi, Ego, Egu;
-	uint64_t Eka, Eke, Eki, Eko, Eku;
-	uint64_t Ema, Eme, Emi, Emo, Emu;
-	uint64_t Esa, Ese, Esi, Eso, Esu;
-
-	//copyFromState(A, state)
-	Aba = pdata64[0];
-	Abe = pdata64[1];
-	Abi = pdata64[2];
-	Abo = pdata64[3];
-	Abu = pdata64[4];
-	Aga = pdata64[5];
-	Age = pdata64[6];
-	Agi = pdata64[7];
-	Ago = pdata64[8];
-	Agu = (pdata64[9] & 0x00000000FFFFFFFFULL) | (((uint64_t)cuda_swab32(nonce + ((blockIdx.x * blockDim.x) + threadIdx.x))) << 32);
-	Aka = 0x0000000000000001ULL;
-	Ake = 0;
-	Aki = 0;
-	Ako = 0;
-	Aku = 0;
-	Ama = 0;
-	Ame = 0x8000000000000000ULL;
-	Ami = 0;
-	Amo = 0;
-	Amu = 0;
-	Asa = 0;
-	Ase = 0;
-	Asi = 0;
-	Aso = 0;
-	Asu = 0;
-
-#pragma unroll 12
-	for( int laneCount = 0; laneCount < 24; laneCount += 2 )
-	{
-		//    prepareTheta
-		BCa = Aba^Aga^Aka^Ama^Asa;
-		BCe = Abe^Age^Ake^Ame^Ase;
-		BCi = Abi^Agi^Aki^Ami^Asi;
-		BCo = Abo^Ago^Ako^Amo^Aso;
-		BCu = Abu^Agu^Aku^Amu^Asu;
-
-		//thetaRhoPiChiIotaPrepareTheta(round  , A, E)
-		Da = BCu^ROL(BCe, 1);
-		De = BCa^ROL(BCi, 1);
-		Di = BCe^ROL(BCo, 1);
-		Do = BCi^ROL(BCu, 1);
-		Du = BCo^ROL(BCa, 1);
-
-		Aba ^= Da;
-		BCa = Aba;
-		Age ^= De;
-		BCe = ROL(Age, 44);
-		Aki ^= Di;
-		BCi = ROL(Aki, 43);
-		Amo ^= Do;
-		BCo = ROL(Amo, 21);
-		Asu ^= Du;
-		BCu = ROL(Asu, 14);
-		Eba =   BCa ^((~BCe)&  BCi );
-		Eba ^= (uint64_t)KeccakF_RoundConstants[laneCount];
-		Ebe =   BCe ^((~BCi)&  BCo );
-		Ebi =   BCi ^((~BCo)&  BCu );
-		Ebo =   BCo ^((~BCu)&  BCa );
-		Ebu =   BCu ^((~BCa)&  BCe );
-
-		Abo ^= Do;
-		BCa = ROL(Abo, 28);
-		Agu ^= Du;
-		BCe = ROL(Agu, 20);
-		Aka ^= Da;
-		BCi = ROL(Aka,  3);
-		Ame ^= De;
-		BCo = ROL(Ame, 45);
-		Asi ^= Di;
-		BCu = ROL(Asi, 61);
-		Ega =   BCa ^((~BCe)&  BCi );
-		Ege =   BCe ^((~BCi)&  BCo );
-		Egi =   BCi ^((~BCo)&  BCu );
-		Ego =   BCo ^((~BCu)&  BCa );
-		Egu =   BCu ^((~BCa)&  BCe );
-
-		Abe ^= De;
-		BCa = ROL(Abe,  1);
-		Agi ^= Di;
-		BCe = ROL(Agi,  6);
-		Ako ^= Do;
-		BCi = ROL(Ako, 25);
-		Amu ^= Du;
-		BCo = ROL_mult8(Amu,  8);
-		Asa ^= Da;
-		BCu = ROL(Asa, 18);
-		Eka =   BCa ^((~BCe)&  BCi );
-		Eke =   BCe ^((~BCi)&  BCo );
-		Eki =   BCi ^((~BCo)&  BCu );
-		Eko =   BCo ^((~BCu)&  BCa );
-		Eku =   BCu ^((~BCa)&  BCe );
-
-		Abu ^= Du;
-		BCa = ROL(Abu, 27);
-		Aga ^= Da;
-		BCe = ROL(Aga, 36);
-		Ake ^= De;
-		BCi = ROL(Ake, 10);
-		Ami ^= Di;
-		BCo = ROL(Ami, 15);
-		Aso ^= Do;
-		BCu = ROL_mult8(Aso, 56);
-		Ema =   BCa ^((~BCe)&  BCi );
-		Eme =   BCe ^((~BCi)&  BCo );
-		Emi =   BCi ^((~BCo)&  BCu );
-		Emo =   BCo ^((~BCu)&  BCa );
-		Emu =   BCu ^((~BCa)&  BCe );
-
-		Abi ^= Di;
-		BCa = ROL(Abi, 62);
-		Ago ^= Do;
-		BCe = ROL(Ago, 55);
-		Aku ^= Du;
-		BCi = ROL(Aku, 39);
-		Ama ^= Da;
-		BCo = ROL(Ama, 41);
-		Ase ^= De;
-		BCu = ROL(Ase,  2);
-		Esa =   BCa ^((~BCe)&  BCi );
-		Ese =   BCe ^((~BCi)&  BCo );
-		Esi =   BCi ^((~BCo)&  BCu );
-		Eso =   BCo ^((~BCu)&  BCa );
-		Esu =   BCu ^((~BCa)&  BCe );
-
-		//    prepareTheta
-		BCa = Eba^Ega^Eka^Ema^Esa;
-		BCe = Ebe^Ege^Eke^Eme^Ese;
-		BCi = Ebi^Egi^Eki^Emi^Esi;
-		BCo = Ebo^Ego^Eko^Emo^Eso;
-		BCu = Ebu^Egu^Eku^Emu^Esu;
-
-		//thetaRhoPiChiIotaPrepareTheta(round+1, E, A)
-		Da = BCu^ROL(BCe, 1);
-		De = BCa^ROL(BCi, 1);
-		Di = BCe^ROL(BCo, 1);
-		Do = BCi^ROL(BCu, 1);
-		Du = BCo^ROL(BCa, 1);
-
-		Eba ^= Da;
-		BCa = Eba;
-		Ege ^= De;
-		BCe = ROL(Ege, 44);
-		Eki ^= Di;
-		BCi = ROL(Eki, 43);
-		Emo ^= Do;
-		BCo = ROL(Emo, 21);
-		Esu ^= Du;
-		BCu = ROL(Esu, 14);
-		Aba =   BCa ^((~BCe)&  BCi );
-		Aba ^= (uint64_t)KeccakF_RoundConstants[laneCount+1];
-		Abe =   BCe ^((~BCi)&  BCo );
-		Abi =   BCi ^((~BCo)&  BCu );
-		Abo =   BCo ^((~BCu)&  BCa );
-		Abu =   BCu ^((~BCa)&  BCe );
-
-		Ebo ^= Do;
-		BCa = ROL(Ebo, 28);
-		Egu ^= Du;
-		BCe = ROL(Egu, 20);
-		Eka ^= Da;
-		BCi = ROL(Eka, 3);
-		Eme ^= De;
-		BCo = ROL(Eme, 45);
-		Esi ^= Di;
-		BCu = ROL(Esi, 61);
-		Aga =   BCa ^((~BCe)&  BCi );
-		Age =   BCe ^((~BCi)&  BCo );
-		Agi =   BCi ^((~BCo)&  BCu );
-		Ago =   BCo ^((~BCu)&  BCa );
-		Agu =   BCu ^((~BCa)&  BCe );
-
-		Ebe ^= De;
-		BCa = ROL(Ebe, 1);
-		Egi ^= Di;
-		BCe = ROL(Egi, 6);
-		Eko ^= Do;
-		BCi = ROL(Eko, 25);
-		Emu ^= Du;
-		BCo = ROL_mult8(Emu, 8);
-		Esa ^= Da;
-		BCu = ROL(Esa, 18);
-		Aka =   BCa ^((~BCe)&  BCi );
-		Ake =   BCe ^((~BCi)&  BCo );
-		Aki =   BCi ^((~BCo)&  BCu );
-		Ako =   BCo ^((~BCu)&  BCa );
-		Aku =   BCu ^((~BCa)&  BCe );
-
-		Ebu ^= Du;
-		BCa = ROL(Ebu, 27);
-		Ega ^= Da;
-		BCe = ROL(Ega, 36);
-		Eke ^= De;
-		BCi = ROL(Eke, 10);
-		Emi ^= Di;
-		BCo = ROL(Emi, 15);
-		Eso ^= Do;
-		BCu = ROL_mult8(Eso, 56);
-		Ama =   BCa ^((~BCe)&  BCi );
-		Ame =   BCe ^((~BCi)&  BCo );
-		Ami =   BCi ^((~BCo)&  BCu );
-		Amo =   BCo ^((~BCu)&  BCa );
-		Amu =   BCu ^((~BCa)&  BCe );
-
-		Ebi ^= Di;
-		BCa = ROL(Ebi, 62);
-		Ego ^= Do;
-		BCe = ROL(Ego, 55);
-		Eku ^= Du;
-		BCi = ROL(Eku, 39);
-		Ema ^= Da;
-		BCo = ROL(Ema, 41);
-		Ese ^= De;
-		BCu = ROL(Ese, 2);
-		Asa =   BCa ^((~BCe)&  BCi );
-		Ase =   BCe ^((~BCi)&  BCo );
-		Asi =   BCi ^((~BCo)&  BCu );
-		Aso =   BCo ^((~BCu)&  BCa );
-		Asu =   BCu ^((~BCa)&  BCe );
-	}
-
-	if (validate) {
-		g_out += 4 * ((blockIdx.x * blockDim.x) + threadIdx.x);
-		g_out[3] = Abo;
-		g_out[2] = Abi;
-		g_out[1] = Abe;
-		g_out[0] = Aba;
-	}
-
-	// the likelyhood of meeting the hashing target is so low, that we're not guarding this
-	// with atomic writes, locks or similar...
-	uint64_t *g_good64 = (uint64_t*)g_good;
-	if (Abo <=  ptarget64[3]) {
-		if (Abo < g_good64[3]) {
-			g_good64[3] = Abo;
-			g_good64[2] = Abi;
-			g_good64[1] = Abe;
-			g_good64[0] = Aba;
-			g_good[8] = nonce + ((blockIdx.x * blockDim.x) + threadIdx.x);
-		}
-	}
-}
-
-static std::map<int, uint32_t *> context_good[2];
-
-// ... keccak???
-bool default_prepare_keccak256(int thr_id, const uint32_t host_pdata[20], const uint32_t host_ptarget[8])
-{
-	static bool init[MAX_DEVICES] = {false};
-	if (!init[thr_id])
-	{
-		checkCudaErrors(cudaMemcpyToSymbol(KeccakF_RoundConstants, host_KeccakF_RoundConstants, sizeof(host_KeccakF_RoundConstants), 0, cudaMemcpyHostToDevice));
-
-		// allocate pinned host memory for good hashes
-		uint32_t *tmp;
-		checkCudaErrors(cudaMalloc((void **) &tmp, 9*sizeof(uint32_t))); context_good[0][thr_id] = tmp;
-		checkCudaErrors(cudaMalloc((void **) &tmp, 9*sizeof(uint32_t))); context_good[1][thr_id] = tmp;
-
-		init[thr_id] = true;
-	}
-	checkCudaErrors(cudaMemcpyToSymbol(pdata64, host_pdata, 20*sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
-	checkCudaErrors(cudaMemcpyToSymbol(ptarget64, host_ptarget, 8*sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
-
-	return context_good[0][thr_id] && context_good[1][thr_id];
-}
-
-void default_do_keccak256(dim3 grid, dim3 threads, int thr_id, int stream, uint32_t *hash, uint32_t nonce, int throughput, bool do_d2h)
-{
-	checkCudaErrors(cudaMemsetAsync(context_good[stream][thr_id], 0xff, 9 * sizeof(uint32_t), context_streams[stream][thr_id]));
-
-	crypto_hash<<<grid, threads, 0, context_streams[stream][thr_id]>>>((uint64_t*)context_hash[stream][thr_id], nonce, context_good[stream][thr_id], do_d2h);
-
-	// copy hashes from device memory to host (ALL hashes, lots of data...)
-	if (do_d2h && hash != NULL) {
-		size_t mem_size = throughput * sizeof(uint32_t) * 8;
-		checkCudaErrors(cudaMemcpyAsync(hash, context_hash[stream][thr_id], mem_size,
-						cudaMemcpyDeviceToHost, context_streams[stream][thr_id]));
-	}
-	else if (hash != NULL) {
-		// asynchronous copy of winning nonce (just 4 bytes...)
-		checkCudaErrors(cudaMemcpyAsync(hash, context_good[stream][thr_id]+8, sizeof(uint32_t),
-						cudaMemcpyDeviceToHost, context_streams[stream][thr_id]));
-	}
 }

@@ -1,10 +1,10 @@
 /**
  * Hash log of submitted job nonces
- * Prevent duplicate shares
+ * Prevent duplicate shares and remember shares diff
  *
  * (to be merged later with stats)
  *
- * tpruvot@github 2014
+ * tpruvot@github 2014 - 2017
  */
 #include <stdlib.h>
 #include <memory.h>
@@ -18,19 +18,28 @@
 
 /* from miner.h
 struct hashlog_data {
-	uint32_t tm_sent;
+	uint8_t npool;
+	uint8_t pool_type;
+	uint8_t nonce_id;
+	uint8_t job_nonce_id;
 	uint32_t height;
+	double sharediff;
+	uint32_t njobid;
+	uint32_t nonce;
 	uint32_t scanned_from;
 	uint32_t scanned_to;
 	uint32_t last_from;
 	uint32_t tm_add;
 	uint32_t tm_upd;
+	uint32_t tm_sent;
 };
 */
 
 static std::map<uint64_t, hashlog_data> tlastshares;
 
 #define LOG_PURGE_TIMEOUT 5*60
+
+extern struct stratum_ctx stratum;
 
 /**
  * str hex to uint32
@@ -70,11 +79,16 @@ void hashlog_remember_submit(struct work* work, uint32_t nonce)
 	hashlog_data data;
 
 	memset(&data, 0, sizeof(data));
+	data.nonce_id = work->submit_nonce_id;
 	data.scanned_from = work->scanned_from;
-	data.scanned_to = nonce;
+	data.scanned_to = work->scanned_to;
+	data.sharediff = work->sharediff[data.nonce_id];
 	data.height = work->height;
 	data.njobid = (uint32_t) njobid;
 	data.tm_add = data.tm_upd = data.tm_sent = (uint32_t) time(NULL);
+	data.npool = (uint8_t) cur_pooln;
+	data.pool_type = pools[cur_pooln].type;
+	data.job_nonce_id = (uint8_t) stratum.job.shares_count;
 	tlastshares[key] = data;
 }
 
@@ -156,16 +170,42 @@ uint64_t hashlog_get_scan_range(char* jobid)
 uint32_t hashlog_get_last_sent(char* jobid)
 {
 	uint32_t nonce = 0;
-	uint64_t njobid = hextouint(jobid);
+	uint64_t njobid = jobid ? hextouint(jobid) : UINT32_MAX;
 	uint64_t keypfx = (njobid << 32);
-	std::map<uint64_t, hashlog_data>::iterator i = tlastshares.begin();
-	while (i != tlastshares.end()) {
-		if ((keypfx & i->first) == keypfx && i->second.tm_sent > 0) {
+	std::map<uint64_t, hashlog_data>::reverse_iterator i = tlastshares.rbegin();
+	while (i != tlastshares.rend()) {
+		if ((keypfx & i->first) == keypfx && i->second.tm_sent) {
 			nonce = LO_DWORD(i->first);
+			break;
 		}
 		i++;
 	}
 	return nonce;
+}
+
+/**
+ * To display correcly second nonce(s) share diff (on pool accept)
+ */
+double hashlog_get_sharediff(char* jobid, int job_nonceid, double defvalue)
+{
+	double diff = defvalue;
+	const uint64_t njobid = jobid ? hextouint(jobid) : UINT32_MAX;
+	const uint64_t keypfx = (njobid << 32);
+	const uint64_t keymsk = (0xffffffffULL << 32);
+
+	std::map<uint64_t, hashlog_data>::reverse_iterator it = tlastshares.rbegin();
+	while (it != tlastshares.rend()) {
+		if ((keymsk & it->first) == keypfx) {
+			if ((int) it->second.job_nonce_id == job_nonceid && it->second.tm_sent) {
+				diff = it->second.sharediff;
+				// applog(LOG_BLUE, "sharediff nonce %x:%d (%d) match %g",
+				//	njobid, (int) it->second.nonce_id, job_nonceid, diff);
+				break;
+			}
+		}
+		++it;
+	}
+	return diff;
 }
 
 /**
@@ -194,7 +234,7 @@ void hashlog_purge_job(char* jobid)
 	int deleted = 0;
 	uint64_t njobid = hextouint(jobid);
 	uint64_t keypfx = (njobid << 32);
-	uint32_t sz = tlastshares.size();
+	uint32_t sz = (uint32_t) tlastshares.size();
 	std::map<uint64_t, hashlog_data>::iterator i = tlastshares.begin();
 	while (i != tlastshares.end()) {
 		if ((keypfx & i->first) == keypfx) {
@@ -215,7 +255,7 @@ void hashlog_purge_old(void)
 {
 	int deleted = 0;
 	uint32_t now = (uint32_t) time(NULL);
-	uint32_t sz = tlastshares.size();
+	uint32_t sz = (uint32_t) tlastshares.size();
 	std::map<uint64_t, hashlog_data>::iterator i = tlastshares.begin();
 	while (i != tlastshares.end()) {
 		if ((now - i->second.tm_sent) > LOG_PURGE_TIMEOUT) {
@@ -242,7 +282,7 @@ void hashlog_purge_all(void)
  */
 void hashlog_getmeminfo(uint64_t *mem, uint32_t *records)
 {
-	(*records) = tlastshares.size();
+	(*records) = (uint32_t) tlastshares.size();
 	(*mem) = (*records) * sizeof(hashlog_data);
 }
 

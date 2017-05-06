@@ -1,11 +1,15 @@
 #include <memory.h>
 
+#define SPH_C32(x)    ((uint32_t)(x ## U))
+#define SPH_T32(x)    ((x) & SPH_C32(0xFFFFFFFF))
+
 #include "cuda_helper.h"
 
-uint32_t *d_gnounce[MAX_GPUS];
-uint32_t *d_GNonce[MAX_GPUS];
+static uint32_t *h_GNonces[MAX_GPUS];
+static uint32_t *d_GNonces[MAX_GPUS];
+static unsigned int* d_textures[MAX_GPUS][8];
 
-//__constant__ uint32_t pTarget[8];
+__constant__ uint32_t pTarget[8];
 
 #define C32e(x) \
 	  ((SPH_C32(x) >> 24) \
@@ -16,25 +20,30 @@ uint32_t *d_GNonce[MAX_GPUS];
 #define PC32up(j, r)   ((uint32_t)((j) + (r)))
 #define PC32dn(j, r)   0
 #define QC32up(j, r)   0xFFFFFFFF
-#define QC32dn(j, r)   ((((uint32_t)(r)^ ~((uint32_t)(j))) << 24) ^0xffffff)
+#define QC32dn(j, r)   (((uint32_t)(r) << 24) ^ SPH_T32(~((uint32_t)(j) << 24)))
 
-#define B32_0(x)    (x&0xff)
-//#define B32_0(x)    __byte_perm(x, 0, 0x4440)
+#define B32_0(x)    __byte_perm(x, 0, 0x4440)
+//((x) & 0xFF)
 #define B32_1(x)    __byte_perm(x, 0, 0x4441)
+//(((x) >> 8) & 0xFF)
 #define B32_2(x)    __byte_perm(x, 0, 0x4442)
+//(((x) >> 16) & 0xFF)
 #define B32_3(x)    __byte_perm(x, 0, 0x4443)
+//((x) >> 24)
 
-#define USE_SHARED 1
+#define MAXWELL_OR_FERMI 1
+#if MAXWELL_OR_FERMI
+	#define USE_SHARED 1
 	// Maxwell and Fermi cards get the best speed with SHARED access it seems.
-#if USE_SHARED
-	#define T0up(x) (*(mixtabs + (    (x))))
-	#define T0dn(x) (*(mixtabs + (256+(x))))
-	#define T1up(x) (*(mixtabs + (512+(x))))
-	#define T1dn(x) (*(mixtabs + (768+(x))))
-	#define T2up(x) (*(mixtabs + (1024+(x))))
-	#define T2dn(x) (*(mixtabs + (1280+(x))))
-	#define T3up(x) (*(mixtabs + (1536+(x))))
-	#define T3dn(x) (*(mixtabs + (1792+(x))))
+	#if USE_SHARED
+	#define T0up(x) (*((uint32_t*)mixtabs + (    (x))))
+	#define T0dn(x) (*((uint32_t*)mixtabs + (256+(x))))
+	#define T1up(x) (*((uint32_t*)mixtabs + (512+(x))))
+	#define T1dn(x) (*((uint32_t*)mixtabs + (768+(x))))
+	#define T2up(x) (*((uint32_t*)mixtabs + (1024+(x))))
+	#define T2dn(x) (*((uint32_t*)mixtabs + (1280+(x))))
+	#define T3up(x) (*((uint32_t*)mixtabs + (1536+(x))))
+	#define T3dn(x) (*((uint32_t*)mixtabs + (1792+(x))))
 	#else
 	#define T0up(x) tex1Dfetch(t0up2, x)
 	#define T0dn(x) tex1Dfetch(t0dn2, x)
@@ -44,16 +53,28 @@ uint32_t *d_GNonce[MAX_GPUS];
 	#define T2dn(x) tex1Dfetch(t2dn2, x)
 	#define T3up(x) tex1Dfetch(t3up2, x)
 	#define T3dn(x) tex1Dfetch(t3dn2, x)
+	#endif
+#else
+	#define USE_SHARED 1
+	// a healthy mix between shared and textured access provides the highest speed on Compute 3.0 and 3.5!
+	#define T0up(x) (*((uint32_t*)mixtabs + (    (x))))
+	#define T0dn(x) tex1Dfetch(t0dn2, x)
+	#define T1up(x) tex1Dfetch(t1up2, x)
+	#define T1dn(x) (*((uint32_t*)mixtabs + (768+(x))))
+	#define T2up(x) tex1Dfetch(t2up2, x)
+	#define T2dn(x) (*((uint32_t*)mixtabs + (1280+(x))))
+	#define T3up(x) (*((uint32_t*)mixtabs + (1536+(x))))
+	#define T3dn(x) tex1Dfetch(t3dn2, x)
 #endif
 
-texture<uint32_t, 1, cudaReadModeElementType> t0up2;
-texture<uint32_t, 1, cudaReadModeElementType> t0dn2;
-texture<uint32_t, 1, cudaReadModeElementType> t1up2;
-texture<uint32_t, 1, cudaReadModeElementType> t1dn2;
-texture<uint32_t, 1, cudaReadModeElementType> t2up2;
-texture<uint32_t, 1, cudaReadModeElementType> t2dn2;
-texture<uint32_t, 1, cudaReadModeElementType> t3up2;
-texture<uint32_t, 1, cudaReadModeElementType> t3dn2;
+static texture<unsigned int, 1, cudaReadModeElementType> t0up2;
+static texture<unsigned int, 1, cudaReadModeElementType> t0dn2;
+static texture<unsigned int, 1, cudaReadModeElementType> t1up2;
+static texture<unsigned int, 1, cudaReadModeElementType> t1dn2;
+static texture<unsigned int, 1, cudaReadModeElementType> t2up2;
+static texture<unsigned int, 1, cudaReadModeElementType> t2dn2;
+static texture<unsigned int, 1, cudaReadModeElementType> t3up2;
+static texture<unsigned int, 1, cudaReadModeElementType> t3dn2;
 
 #define RSTT(d0, d1, a, b0, b1, b2, b3, b4, b5, b6, b7) do { \
 	t[d0] = T0up(B32_0(a[b0])) \
@@ -85,12 +106,12 @@ extern uint32_t T3up_cpu[];
 extern uint32_t T3dn_cpu[];
 
 __device__ __forceinline__
-void groestl256_perm_P(uint32_t thread, uint32_t *a, uint32_t *mixtabs)
+void groestl256_perm_P(uint32_t thread,uint32_t *a, char *mixtabs)
 {
-	uint32_t t[16];
-	#pragma unroll
+	#pragma unroll 10
 	for (int r = 0; r<10; r++)
 	{
+		uint32_t t[16];
 
 		a[0x0] ^= PC32up(0x00, r);
 		a[0x2] ^= PC32up(0x10, r);
@@ -116,12 +137,12 @@ void groestl256_perm_P(uint32_t thread, uint32_t *a, uint32_t *mixtabs)
 }
 
 __device__ __forceinline__
-void groestl256_perm_Q(uint32_t thread, uint32_t *a, uint32_t *mixtabs)
+void groestl256_perm_Q(uint32_t thread, uint32_t *a, char *mixtabs)
 {
-	uint32_t t[16];
-	#pragma unroll 2
+	#pragma unroll
 	for (int r = 0; r<10; r++)
 	{
+		uint32_t t[16];
 
 		a[0x0] ^= QC32up(0x00, r);
 		a[0x1] ^= QC32dn(0x00, r);
@@ -154,54 +175,29 @@ void groestl256_perm_Q(uint32_t thread, uint32_t *a, uint32_t *mixtabs)
 	}
 }
 
-__global__ __launch_bounds__(256,2)
-void groestl256_gpu_hash32(uint32_t threads, uint32_t startNounce, uint64_t *const __restrict__ outputHash, uint32_t *const __restrict__ nonceVector, uint32_t target)
+__global__ __launch_bounds__(256,1)
+void groestl256_gpu_hash_32(uint32_t threads, uint32_t startNounce, uint64_t *outputHash, uint32_t *resNonces)
 {
 #if USE_SHARED
-	__shared__ uint32_t mixtabs[2048];
-	uint32_t backup = target;
+	extern __shared__ char mixtabs[];
 
-/*
-	if (threadIdx.x < 256) 
-	{
-		*(mixtabs + (threadIdx.x)) = tex1Dfetch(t0up2, threadIdx.x);
-		*(mixtabs + (256 + threadIdx.x)) = tex1Dfetch(t0dn2, threadIdx.x);
-		*(mixtabs + (512 + threadIdx.x)) = tex1Dfetch(t1up2, threadIdx.x);
-		*(mixtabs + (768 + threadIdx.x)) = tex1Dfetch(t1dn2, threadIdx.x);
-		*(mixtabs + (1024 + threadIdx.x)) = tex1Dfetch(t2up2, threadIdx.x);
-		*(mixtabs + (1280 + threadIdx.x)) = tex1Dfetch(t2dn2, threadIdx.x);
-		*(mixtabs + (1536 + threadIdx.x)) = tex1Dfetch(t3up2, threadIdx.x);
-		*(mixtabs + (1792 + threadIdx.x)) = tex1Dfetch(t3dn2, threadIdx.x);
-	}
-*/
-	if (threadIdx.x < 128)
-	{
-		*(mixtabs + (threadIdx.x)) = tex1Dfetch(t0up2, threadIdx.x);
-		*(mixtabs + (128 + threadIdx.x)) = tex1Dfetch(t0up2, threadIdx.x+128);
-		*(mixtabs + (256 + threadIdx.x)) = tex1Dfetch(t0dn2, threadIdx.x);
-		*(mixtabs + (128 + 256 + threadIdx.x)) = tex1Dfetch(t0dn2, threadIdx.x+128);
-		*(mixtabs + (512 + threadIdx.x)) = tex1Dfetch(t1up2, threadIdx.x);
-		*(mixtabs + (128 + 512 + threadIdx.x)) = tex1Dfetch(t1up2, threadIdx.x + 128);
-		*(mixtabs + (768 + threadIdx.x)) = tex1Dfetch(t1dn2, threadIdx.x);
-		*(mixtabs + (128 + 768 + threadIdx.x)) = tex1Dfetch(t1dn2, threadIdx.x + 128);
-		*(mixtabs + (1024 + threadIdx.x)) = tex1Dfetch(t2up2, threadIdx.x);
-		*(mixtabs + (128 + 1024 + threadIdx.x)) = tex1Dfetch(t2up2, threadIdx.x + 128);
-		*(mixtabs + (1280 + threadIdx.x)) = tex1Dfetch(t2dn2, threadIdx.x);
-		*(mixtabs + (128 + 1280 + threadIdx.x)) = tex1Dfetch(t2dn2, threadIdx.x + 128);
-		*(mixtabs + (1536 + threadIdx.x)) = tex1Dfetch(t3up2, threadIdx.x);
-		*(mixtabs + (128 + 1536 + threadIdx.x)) = tex1Dfetch(t3up2, threadIdx.x + 128);
-		*(mixtabs + (1792 + threadIdx.x)) = tex1Dfetch(t3dn2, threadIdx.x);
-		*(mixtabs + (128 + 1792 + threadIdx.x)) = tex1Dfetch(t3dn2, threadIdx.x + 128);
+	if (threadIdx.x < 256) {
+		*((uint32_t*)mixtabs + (threadIdx.x)) = tex1Dfetch(t0up2, threadIdx.x);
+		*((uint32_t*)mixtabs + (256 + threadIdx.x)) = tex1Dfetch(t0dn2, threadIdx.x);
+		*((uint32_t*)mixtabs + (512 + threadIdx.x)) = tex1Dfetch(t1up2, threadIdx.x);
+		*((uint32_t*)mixtabs + (768 + threadIdx.x)) = tex1Dfetch(t1dn2, threadIdx.x);
+		*((uint32_t*)mixtabs + (1024 + threadIdx.x)) = tex1Dfetch(t2up2, threadIdx.x);
+		*((uint32_t*)mixtabs + (1280 + threadIdx.x)) = tex1Dfetch(t2dn2, threadIdx.x);
+		*((uint32_t*)mixtabs + (1536 + threadIdx.x)) = tex1Dfetch(t3up2, threadIdx.x);
+		*((uint32_t*)mixtabs + (1792 + threadIdx.x)) = tex1Dfetch(t3dn2, threadIdx.x);
 	}
 
+	__syncthreads();
 #endif
 
 	uint32_t thread = (blockDim.x * blockIdx.x + threadIdx.x);
-
 	if (thread < threads)
 	{
-		uint32_t nonce = (startNounce + thread);
-
 		// GROESTL
 		uint32_t message[16];
 		uint32_t state[16];
@@ -243,65 +239,97 @@ void groestl256_gpu_hash32(uint32_t threads, uint32_t startNounce, uint64_t *con
 #else
 		groestl256_perm_P(thread, message, NULL);
 #endif
+		state[14] ^= message[14];
 		state[15] ^= message[15];
 
-		if (state[15] <= backup)
-		{
-			uint32_t tmp = atomicCAS(nonceVector, 0xffffffff, nonce);
-			if (tmp != 0xffffffff)
-				nonceVector[1] = nonce;
+		uint32_t nonce = startNounce + thread;
+		if (state[15] <= pTarget[7]) {
+			atomicMin(&resNonces[1], resNonces[0]);
+			atomicMin(&resNonces[0], nonce);
 		}
 	}
 }
 
-#define texDef(texname, texmem, texsource, texsize) \
-	uint32_t *texmem; \
+#define texDef(id, texname, texmem, texsource, texsize) { \
+	unsigned int *texmem; \
 	cudaMalloc(&texmem, texsize); \
+	d_textures[thr_id][id] = texmem; \
 	cudaMemcpy(texmem, texsource, texsize, cudaMemcpyHostToDevice); \
 	texname.normalized = 0; \
 	texname.filterMode = cudaFilterModePoint; \
 	texname.addressMode[0] = cudaAddressModeClamp; \
-	{ cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uint32_t>(); \
-	  cudaBindTexture(NULL, &texname, texmem, &channelDesc, texsize ); } \
+	{ cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<unsigned int>(); \
+	  cudaBindTexture(NULL, &texname, texmem, &channelDesc, texsize ); \
+	} \
+}
 
 __host__
 void groestl256_cpu_init(int thr_id, uint32_t threads)
 {
-
 	// Texturen mit obigem Makro initialisieren
-	texDef(t0up2, d_T0up, T0up_cpu, sizeof(uint32_t) * 256);
-	texDef(t0dn2, d_T0dn, T0dn_cpu, sizeof(uint32_t) * 256);
-	texDef(t1up2, d_T1up, T1up_cpu, sizeof(uint32_t) * 256);
-	texDef(t1dn2, d_T1dn, T1dn_cpu, sizeof(uint32_t) * 256);
-	texDef(t2up2, d_T2up, T2up_cpu, sizeof(uint32_t) * 256);
-	texDef(t2dn2, d_T2dn, T2dn_cpu, sizeof(uint32_t) * 256);
-	texDef(t3up2, d_T3up, T3up_cpu, sizeof(uint32_t) * 256);
-	texDef(t3dn2, d_T3dn, T3dn_cpu, sizeof(uint32_t) * 256);
+	texDef(0, t0up2, d_T0up, T0up_cpu, sizeof(uint32_t) * 256);
+	texDef(1, t0dn2, d_T0dn, T0dn_cpu, sizeof(uint32_t) * 256);
+	texDef(2, t1up2, d_T1up, T1up_cpu, sizeof(uint32_t) * 256);
+	texDef(3, t1dn2, d_T1dn, T1dn_cpu, sizeof(uint32_t) * 256);
+	texDef(4, t2up2, d_T2up, T2up_cpu, sizeof(uint32_t) * 256);
+	texDef(5, t2dn2, d_T2dn, T2dn_cpu, sizeof(uint32_t) * 256);
+	texDef(6, t3up2, d_T3up, T3up_cpu, sizeof(uint32_t) * 256);
+	texDef(7, t3dn2, d_T3dn, T3dn_cpu, sizeof(uint32_t) * 256);
 
-	cudaMalloc(&d_GNonce[thr_id], 2*sizeof(uint32_t));
-	cudaMallocHost(&d_gnounce[thr_id], 2*sizeof(uint32_t));
+	cudaMalloc(&d_GNonces[thr_id], 2*sizeof(uint32_t));
+	cudaMallocHost(&h_GNonces[thr_id], 2*sizeof(uint32_t));
 }
 
 __host__
-void groestl256_cpu_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, uint64_t *d_outputHash, uint32_t *resultnonces, uint32_t target)
+void groestl256_cpu_free(int thr_id)
 {
-	cudaMemset(d_GNonce[thr_id], 0xffffffff, 2 * sizeof(uint32_t));
-	const uint32_t threadsperblock = 128;
+	for (int i=0; i<8; i++)
+		cudaFree(d_textures[thr_id][i]);
+
+	cudaFree(d_GNonces[thr_id]);
+	cudaFreeHost(h_GNonces[thr_id]);
+}
+
+__host__
+uint32_t groestl256_cpu_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, uint64_t *d_outputHash, int order)
+{
+	uint32_t result = UINT32_MAX;
+	cudaMemset(d_GNonces[thr_id], 0xff, 2*sizeof(uint32_t));
+	const uint32_t threadsperblock = 256;
 
 	// berechne wie viele Thread Blocks wir brauchen
 	dim3 grid((threads + threadsperblock-1)/threadsperblock);
 	dim3 block(threadsperblock);
 
-	groestl256_gpu_hash32<<<grid, block>>>(threads, startNounce, d_outputHash, d_GNonce[thr_id],target);
-	cudaMemcpy(d_gnounce[thr_id], d_GNonce[thr_id], 2*sizeof(uint32_t), cudaMemcpyDeviceToHost);
-	resultnonces[0] = *(d_gnounce[thr_id]);
-	resultnonces[1] = *(d_gnounce[thr_id] + 1);
+#if USE_SHARED
+	size_t shared_size = 8 * 256 * sizeof(uint32_t);
+#else
+	size_t shared_size = 0;
+#endif
+	groestl256_gpu_hash_32<<<grid, block, shared_size>>>(threads, startNounce, d_outputHash, d_GNonces[thr_id]);
+
+	MyStreamSynchronize(NULL, order, thr_id);
+
+	// get first found nonce
+	cudaMemcpy(h_GNonces[thr_id], d_GNonces[thr_id], 1*sizeof(uint32_t), cudaMemcpyDeviceToHost);
+	result = *h_GNonces[thr_id];
+
+	return result;
 }
 
-/*
+__host__
+uint32_t groestl256_getSecNonce(int thr_id, int num)
+{
+	uint32_t results[2];
+	memset(results, 0xFF, sizeof(results));
+	cudaMemcpy(results, d_GNonces[thr_id], sizeof(results), cudaMemcpyDeviceToHost);
+	if (results[1] == results[0])
+		return UINT32_MAX;
+	return results[num];
+}
+
 __host__
 void groestl256_setTarget(const void *pTargetIn)
 {
-	cudaMemcpyToSymbol(pTarget, pTargetIn, 8 * sizeof(uint32_t), 0, cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(pTarget, pTargetIn, 32, 0, cudaMemcpyHostToDevice);
 }
-*/

@@ -1,14 +1,16 @@
 /*
-	scrypt-jane by Andrew M, https://github.com/floodyberry/scrypt-jane
-
-	Public Domain or MIT License, whichever is easier
-*/
+ * scrypt-jane by Andrew M, https://github.com/floodyberry/scrypt-jane
+ *
+ * Public Domain or MIT License, whichever is easier
+ *
+ * Adapted to ccminer by tpruvot@github (2015)
+ */
 
 #include "miner.h"
 
 #include "scrypt/scrypt-jane.h"
 #include "scrypt/code/scrypt-jane-portable.h"
-#include "scrypt/code/scrypt-jane-romix.h"
+#include "scrypt/code/scrypt-jane-chacha.h"
 #include "scrypt/keccak.h"
 
 #include "scrypt/salsa_kernel.h"
@@ -50,8 +52,8 @@ static const uint64_t keccak_round_constants[24] = {
 	0x0000000080000001ull, 0x8000000080008008ull
 };
 
-static void
-keccak_block(scrypt_hash_state *S, const uint8_t *in) {
+static void keccak_block(scrypt_hash_state *S, const uint8_t *in)
+{
 	size_t i;
 	uint64_t *s = S->state, t[5], u[5], v, w;
 
@@ -120,13 +122,12 @@ keccak_block(scrypt_hash_state *S, const uint8_t *in) {
 	}
 }
 
-static void
-scrypt_hash_init(scrypt_hash_state *S) {
+static void scrypt_hash_init(scrypt_hash_state *S) {
 	memset(S, 0, sizeof(*S));
 }
 
-static void
-scrypt_hash_update(scrypt_hash_state *S, const uint8_t *in, size_t inlen) {
+static void scrypt_hash_update(scrypt_hash_state *S, const uint8_t *in, size_t inlen)
+{
 	size_t want;
 
 	/* handle the previous data */
@@ -155,8 +156,8 @@ scrypt_hash_update(scrypt_hash_state *S, const uint8_t *in, size_t inlen) {
 		memcpy(S->buffer, in, S->leftover);
 }
 
-static void
-scrypt_hash_finish(scrypt_hash_state *S, uint8_t *hash) {
+static void scrypt_hash_finish(scrypt_hash_state *S, uint8_t *hash)
+{
 	size_t i;
 
 	S->buffer[S->leftover] = 0x01;
@@ -178,17 +179,18 @@ typedef struct scrypt_hmac_state_t {
 } scrypt_hmac_state;
 
 
-static void
-scrypt_hash(scrypt_hash_digest hash, const uint8_t *m, size_t mlen) {
+static void scrypt_hash(scrypt_hash_digest hash, const uint8_t *m, size_t mlen)
+{
 	scrypt_hash_state st;
+
 	scrypt_hash_init(&st);
 	scrypt_hash_update(&st, m, mlen);
 	scrypt_hash_finish(&st, hash);
 }
 
 /* hmac */
-static void
-scrypt_hmac_init(scrypt_hmac_state *st, const uint8_t *key, size_t keylen) {
+static void scrypt_hmac_init(scrypt_hmac_state *st, const uint8_t *key, size_t keylen)
+{
 	uint8_t pad[SCRYPT_HASH_BLOCK_SIZE] = {0};
 	size_t i;
 
@@ -216,14 +218,14 @@ scrypt_hmac_init(scrypt_hmac_state *st, const uint8_t *key, size_t keylen) {
 	scrypt_hash_update(&st->outer, pad, SCRYPT_HASH_BLOCK_SIZE);
 }
 
-static void
-scrypt_hmac_update(scrypt_hmac_state *st, const uint8_t *m, size_t mlen) {
+static void scrypt_hmac_update(scrypt_hmac_state *st, const uint8_t *m, size_t mlen)
+{
 	/* h(inner || m...) */
 	scrypt_hash_update(&st->inner, m, mlen);
 }
 
-static void
-scrypt_hmac_finish(scrypt_hmac_state *st, scrypt_hash_digest mac) {
+static void scrypt_hmac_finish(scrypt_hmac_state *st, scrypt_hash_digest mac)
+{
 	/* h(inner || m) */
 	scrypt_hash_digest innerhash;
 	scrypt_hash_finish(&st->inner, innerhash);
@@ -237,13 +239,13 @@ scrypt_hmac_finish(scrypt_hmac_state *st, scrypt_hash_digest mac) {
  * Special version where N = 1
  *  - mikaelh
  */
-static void
-scrypt_pbkdf2_1(const uint8_t *password, size_t password_len, const uint8_t *salt, size_t salt_len, uint8_t *out, size_t bytes) {
+static void scrypt_pbkdf2_1(const uint8_t *password, size_t password_len,
+	const uint8_t *salt, size_t salt_len, uint8_t *out, uint64_t bytes)
+{
 	scrypt_hmac_state hmac_pw, hmac_pw_salt, work;
 	scrypt_hash_digest ti, u;
 	uint8_t be[4];
-	uint32_t i, /*j,*/ blocks;
-//	uint64_t c;
+	uint32_t i, blocks;
 
 	/* bytes must be <= (0xffffffff - (SCRYPT_HASH_DIGEST_SIZE - 1)), which they will always be under scrypt */
 
@@ -263,7 +265,7 @@ scrypt_pbkdf2_1(const uint8_t *password, size_t password_len, const uint8_t *sal
 		scrypt_hmac_finish(&work, ti);
 		memcpy(u, ti, sizeof(u));
 
-		memcpy(out, ti, (bytes > SCRYPT_HASH_DIGEST_SIZE) ? SCRYPT_HASH_DIGEST_SIZE : bytes);
+		memcpy(out, ti, (size_t) (bytes > SCRYPT_HASH_DIGEST_SIZE ? SCRYPT_HASH_DIGEST_SIZE : bytes));
 		out += SCRYPT_HASH_DIGEST_SIZE;
 		bytes -= SCRYPT_HASH_DIGEST_SIZE;
 	}
@@ -271,16 +273,14 @@ scrypt_pbkdf2_1(const uint8_t *password, size_t password_len, const uint8_t *sal
 
 // ---------------------------- END PBKDF2 functions ------------------------------------
 
-static void
-scrypt_fatal_error_default(const char *msg) {
+static void scrypt_fatal_error_default(const char *msg) {
 	fprintf(stderr, "%s\n", msg);
 	exit(1);
 }
 
 static scrypt_fatal_errorfn scrypt_fatal_error = scrypt_fatal_error_default;
 
-void
-scrypt_set_fatal_error_default(scrypt_fatal_errorfn fn) {
+void scrypt_set_fatal_error_default(scrypt_fatal_errorfn fn) {
 	scrypt_fatal_error = fn;
 }
 
@@ -293,8 +293,8 @@ static uint8_t *mem_base = (uint8_t *)0;
 static size_t mem_bump = 0;
 
 /* allocations are assumed to be multiples of 64 bytes and total allocations not to exceed ~1.01gb */
-static scrypt_aligned_alloc
-scrypt_alloc(uint64_t size) {
+static scrypt_aligned_alloc scrypt_alloc(uint64_t size)
+{
 	scrypt_aligned_alloc aa;
 	if (!mem_base) {
 		mem_base = (uint8_t *)malloc((1024 * 1024 * 1024) + (1024 * 1024) + (SCRYPT_BLOCK_BYTES - 1));
@@ -308,13 +308,13 @@ scrypt_alloc(uint64_t size) {
 	return aa;
 }
 
-static void
-scrypt_free(scrypt_aligned_alloc *aa) {
+static void scrypt_free(scrypt_aligned_alloc *aa)
+{
 	mem_bump = 0;
 }
 #else
-static scrypt_aligned_alloc
-scrypt_alloc(uint64_t size) {
+static scrypt_aligned_alloc scrypt_alloc(uint64_t size)
+{
 	static const size_t max_alloc = (size_t)-1;
 	scrypt_aligned_alloc aa;
 	size += (SCRYPT_BLOCK_BYTES - 1);
@@ -327,23 +327,24 @@ scrypt_alloc(uint64_t size) {
 	return aa;
 }
 
-static void
-scrypt_free(scrypt_aligned_alloc *aa) {
+static void scrypt_free(scrypt_aligned_alloc *aa)
+{
 	free(aa->mem);
 }
 #endif
 
 
 // yacoin: increasing Nfactor gradually
-unsigned char GetNfactor(uint32_t nTimestamp) {
+unsigned char GetNfactor(unsigned int nTimestamp)
+{
 	int l = 0;
 
-	uint32_t Nfactor = 0;
+	unsigned int Nfactor = 0;
 
 	// Yacoin defaults
-	uint32_t Ntimestamp = 1367991200;
-	uint32_t minN = 4;
-	uint32_t maxN = 30;
+	unsigned int Ntimestamp = 1367991200;
+	unsigned int minN = 4;
+	unsigned int maxN = 30;
 
 	if (strlen(jane_params) > 0) {
 		if (!strcmp(jane_params, "YAC") || !strcasecmp(jane_params, "Yacoin")) {} // No-Op
@@ -394,6 +395,9 @@ unsigned char GetNfactor(uint32_t nTimestamp) {
 		} else if (!strcmp(jane_params, "RAD") || !strcasecmp(jane_params, "RadioactiveCoin")) {
 			// InternetCoin:1389196388, minN: 4, maxN: 30
 			Ntimestamp = 1389196388; minN= 4; maxN= 30;
+		} else if (!strcmp(jane_params, "LEO") || !strcasecmp(jane_params, "LEOCoin")) {
+			// LEOCoin:1402845776, minN: 4, maxN: 30
+			Ntimestamp = 1402845776; minN= 4; maxN= 30;
 		} else {
 			if (sscanf(jane_params, "%u,%u,%u", &Ntimestamp, &minN, &maxN) != 3)
 			if (sscanf(jane_params, "%u", &Nfactor) == 1) return Nfactor; // skip bounding against minN, maxN
@@ -425,15 +429,34 @@ unsigned char GetNfactor(uint32_t nTimestamp) {
 	return Nfactor;
 }
 
+static bool init[MAX_GPUS] = { 0 };
+
+// cleanup
+void free_scrypt_jane(int thr_id)
+{
+	int dev_id = device_map[thr_id];
+
+	if (!init[thr_id])
+		return;
+
+	cudaSetDevice(dev_id);
+	cudaDeviceSynchronize();
+	cudaDeviceReset(); // well, simple way to free ;)
+
+	init[thr_id] = false;
+}
+
 #define bswap_32x4(x) ((((x) << 24) & 0xff000000u) | (((x) << 8) & 0x00ff0000u) \
 					 | (((x) >> 8) & 0x0000ff00u) | (((x) >> 24) & 0x000000ffu))
-
 static int s_Nfactor = 0;
 
-int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, unsigned char *scratchbuf,
-	uint32_t max_nonce, unsigned long *hashes_done, struct timeval *tv_start, struct timeval *tv_end)
+int scanhash_scrypt_jane(int thr_id, struct work *work, uint32_t max_nonce, unsigned long *hashes_done,
+	unsigned char *scratchbuf, struct timeval *tv_start, struct timeval *tv_end)
 {
+	uint32_t *pdata = work->data;
+	uint32_t *ptarget = work->target;
 	const uint32_t Htarg = ptarget[7];
+	uint32_t N;
 
 	if (s_Nfactor == 0 && strlen(jane_params) > 0)
 		applog(LOG_INFO, "Given scrypt-jane parameters: %s", jane_params);
@@ -442,14 +465,12 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 	if (Nfactor > scrypt_maxN) {
 		scrypt_fatal_error("scrypt: N out of range");
 	}
+	N = (1 << (Nfactor + 1));
 
 	if (Nfactor != s_Nfactor)
 	{
-		// all of this isn't very thread-safe...
-		opt_nfactor = (1 << (Nfactor + 1));
-
-		applog(LOG_INFO, "Nfactor is %d (N=%d)!", Nfactor, opt_nfactor);
-
+		opt_nfactor = Nfactor;
+		applog(LOG_INFO, "N-factor is %d (%d)!", Nfactor, N);
 		if (s_Nfactor != 0) {
 			// handle N-factor increase at runtime
 			// by adjusting the lookup_gap by factor 2
@@ -460,7 +481,20 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 		s_Nfactor = Nfactor;
 	}
 
-	int throughput = cuda_throughput(thr_id);
+	static __thread int throughput = 0;
+	if(!init[thr_id]) {
+		int dev_id = device_map[thr_id];
+
+		cudaSetDevice(dev_id);
+		cudaDeviceSynchronize();
+		cudaDeviceReset();
+		cudaSetDevice(dev_id);
+
+		throughput = cuda_throughput(thr_id);
+		gpulog(LOG_INFO, thr_id, "Intensity set to %g, %u cuda threads", throughput2intensity(throughput), throughput);
+
+		init[thr_id] = true;
+	}
 
 	if(throughput == 0)
 		return -1;
@@ -480,7 +514,7 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 	if (parallel == 2) prepare_keccak512(thr_id, pdata);
 
 	scrypt_aligned_alloc Xbuf[2] = { scrypt_alloc(128 * throughput), scrypt_alloc(128 * throughput) };
-	scrypt_aligned_alloc Vbuf = scrypt_alloc((uint64_t)opt_nfactor * 128);
+	scrypt_aligned_alloc Vbuf = scrypt_alloc(N * 128);
 	scrypt_aligned_alloc Ybuf = scrypt_alloc(128);
 
 	uint32_t nonce[2];
@@ -498,6 +532,8 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 
 		if (parallel < 2)
 		{
+			// half of cpu
+
 			for(int i=0;i<throughput;++i) {
 				uint32_t tmp_nonce = n++;
 				data[nxt][20*i + 19] = bswap_32x4(tmp_nonce);
@@ -509,16 +545,14 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 			memcpy(cuda_X[nxt], Xbuf[nxt].ptr, 128 * throughput);
 			cuda_scrypt_serialize(thr_id, nxt);
 			cuda_scrypt_HtoD(thr_id, cuda_X[nxt], nxt);
-			cuda_scrypt_core(thr_id, nxt, opt_nfactor);
+			cuda_scrypt_core(thr_id, nxt, N);
 			cuda_scrypt_done(thr_id, nxt);
 
 			cuda_scrypt_DtoH(thr_id, cuda_X[nxt], nxt, false);
 
-			cuda_scrypt_flush(thr_id, nxt);
-
-			if(!cuda_scrypt_sync(thr_id, cur))
-			{
-				return -1;
+			//cuda_scrypt_flush(thr_id, nxt);
+			if(!cuda_scrypt_sync(thr_id, nxt)) {
+				break;
 			}
 
 			memcpy(Xbuf[cur].ptr, cuda_X[cur], 128 * throughput);
@@ -532,7 +566,7 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 				for(int i=0;i<throughput;++i)
 					scrypt_ROMix_1((scrypt_mix_word_t *)(Xbuf[cur].ptr + 128 * i), (scrypt_mix_word_t *)Ybuf.ptr, (scrypt_mix_word_t *)Vbuf.ptr, N);
 
-				uint32_t err = 0;
+				unsigned int err = 0;
 				for(int i=0;i<throughput;++i) {
 					unsigned char *ref = (Xbuf[cur].ptr + 128 * i);
 					unsigned char *dat = (unsigned char*)(cuda_X[cur] + 32 * i);
@@ -553,58 +587,59 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 			}
 #endif
 		} else {
+
+			// all on gpu
+
 			n += throughput;
+			if (opt_debug && (iteration % 64 == 0))
+				applog(LOG_DEBUG, "GPU #%d: n=%x", device_map[thr_id], n);
 
 			cuda_scrypt_serialize(thr_id, nxt);
 			pre_keccak512(thr_id, nxt, nonce[nxt], throughput);
-			cuda_scrypt_core(thr_id, nxt, opt_nfactor);
-
-			cuda_scrypt_flush(thr_id, nxt);
+			cuda_scrypt_core(thr_id, nxt, N);
+			//cuda_scrypt_flush(thr_id, nxt);
+			if (!cuda_scrypt_sync(thr_id, nxt)) {
+				break;
+			}
 
 			post_keccak512(thr_id, nxt, nonce[nxt], throughput);
 			cuda_scrypt_done(thr_id, nxt);
 
 			cuda_scrypt_DtoH(thr_id, hash[nxt], nxt, true);
-
-			if(!cuda_scrypt_sync(thr_id, cur))
-			{
-				return -1;
+			//cuda_scrypt_flush(thr_id, nxt); // made by cuda_scrypt_sync
+			if (!cuda_scrypt_sync(thr_id, nxt)) {
+				break;
 			}
 		}
 
-		if(iteration > 0)
+		for (int i=0; iteration > 0 && i<throughput; i++)
 		{
-			for(int i=0;i<throughput;++i) {
-				volatile unsigned char *hashc = (unsigned char *)(&hash[cur][8*i]);
+			if (hash[cur][8*i+7] <= Htarg && fulltest(&hash[cur][8*i], ptarget))
+			{
+				uint32_t _ALIGN(64) thash[8], tdata[20];
+				uint32_t tmp_nonce = nonce[cur] + i;
 
-				if (hash[cur][8*i+7] <= Htarg && fulltest(&hash[cur][8*i], ptarget))
+				for(int z=0;z<19;z++)
+					tdata[z] = bswap_32x4(pdata[z]);
+				tdata[19] = bswap_32x4(tmp_nonce);
+
+				scrypt_pbkdf2_1((unsigned char *)tdata, 80, (unsigned char *)tdata, 80, Xbuf[cur].ptr + 128 * i, 128);
+				scrypt_ROMix_1((scrypt_mix_word_t *)(Xbuf[cur].ptr + 128 * i), (scrypt_mix_word_t *)(Ybuf.ptr), (scrypt_mix_word_t *)(Vbuf.ptr), N);
+				scrypt_pbkdf2_1((unsigned char *)tdata, 80, Xbuf[cur].ptr + 128 * i, 128, (unsigned char *)thash, 32);
+
+				if (memcmp(thash, &hash[cur][8*i], 32) == 0)
 				{
-					uint32_t _ALIGN(64) thash[8], tdata[20];
-					uint32_t tmp_nonce = nonce[cur] + i;
-
-					for(int z=0;z<20;z++)
-						tdata[z] = bswap_32x4(pdata[z]);
-					tdata[19] = bswap_32x4(tmp_nonce);
-
-					scrypt_pbkdf2_1((unsigned char *)tdata, 80, (unsigned char *)tdata, 80, Xbuf[cur].ptr + 128 * i, 128);
-					scrypt_ROMix_1((scrypt_mix_word_t *)(Xbuf[cur].ptr + 128 * i), (scrypt_mix_word_t *)(Ybuf.ptr), (scrypt_mix_word_t *)(Vbuf.ptr), opt_nfactor);
-					scrypt_pbkdf2_1((unsigned char *)tdata, 80, Xbuf[cur].ptr + 128 * i, 128, (unsigned char *)thash, 32);
-
-					if (memcmp(thash, &hash[cur][8*i], 32) == 0)
-					{
-						//applog(LOG_INFO, "GPU #%d: %s result validates on CPU.", device_map[thr_id], device_name[thr_id]);
-
-						*hashes_done = n - pdata[19];
-						pdata[19] = tmp_nonce;
-						scrypt_free(&Vbuf);
-						scrypt_free(&Ybuf);
-						scrypt_free(&Xbuf[0]); scrypt_free(&Xbuf[1]);
-						delete[] data[0]; delete[] data[1];
-						gettimeofday(tv_end, NULL);
-						return 1;
-					} else {
-						applog(LOG_INFO, "GPU #%d: %s result does not validate on CPU (i=%d, s=%d)!", device_map[thr_id], device_name[thr_id], i, cur);
-					}
+					work_set_target_ratio(work, thash);
+					*hashes_done = n - pdata[19];
+					pdata[19] = tmp_nonce;
+					scrypt_free(&Vbuf);
+					scrypt_free(&Ybuf);
+					scrypt_free(&Xbuf[0]); scrypt_free(&Xbuf[1]);
+					delete[] data[0]; delete[] data[1];
+					gettimeofday(tv_end, NULL);
+					return 1;
+				} else {
+					gpulog(LOG_WARNING, thr_id, "result does not validate on CPU! (i=%d, s=%d)", i, cur);
 				}
 			}
 		}
@@ -612,7 +647,7 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 		cur = (cur+1)&1;
 		nxt = (nxt+1)&1;
 		++iteration;
-	} while (n <= max_nonce && !scan_abort_flag && !work_restart[thr_id].restart);
+	} while (n <= max_nonce && !work_restart[thr_id].restart);
 
 	scrypt_free(&Vbuf);
 	scrypt_free(&Ybuf);
@@ -623,4 +658,56 @@ int scanhash_scrypt_jane(int thr_id, uint32_t *pdata, const uint32_t *ptarget, u
 	pdata[19] = n;
 	gettimeofday(tv_end, NULL);
 	return 0;
+}
+
+
+static void scrypt_jane_hash_1_1(const uchar *password, size_t password_len, const uchar*salt, size_t salt_len, uint32_t N,
+	uchar *out, uint32_t bytes, uint8_t *X, uint8_t *Y, uint8_t *V)
+{
+	uint32_t chunk_bytes, i;
+	const uint32_t p = SCRYPT_P;
+
+#if !defined(SCRYPT_CHOOSE_COMPILETIME)
+	scrypt_ROMixfn scrypt_ROMix = scrypt_getROMix();
+#endif
+
+	chunk_bytes = SCRYPT_BLOCK_BYTES * SCRYPT_R * 2;
+
+	/* 1: X = PBKDF2(password, salt) */
+	scrypt_pbkdf2_1(password, password_len, salt, salt_len, X, chunk_bytes * p);
+
+	/* 2: X = ROMix(X) */
+	for (i = 0; i < p; i++)
+		scrypt_ROMix_1((scrypt_mix_word_t *)(X + (chunk_bytes * i)), (scrypt_mix_word_t *)Y, (scrypt_mix_word_t *)V, N);
+
+	/* 3: Out = PBKDF2(password, X) */
+	scrypt_pbkdf2_1(password, password_len, X, chunk_bytes * p, out, (size_t) bytes);
+
+#ifdef SCRYPT_PREVENT_STATE_LEAK
+	/* This is an unnecessary security feature - mikaelh */
+	scrypt_ensure_zero(Y, (p + 1) * chunk_bytes);
+#endif
+}
+
+/* for cpu hash test */
+void scryptjane_hash(void* output, const void* input)
+{
+	uint32_t Nsize = 1UL << (opt_nfactor + 1);
+	uint64_t chunk_bytes;
+	uint8_t *X, *Y;
+	scrypt_aligned_alloc YX, V;
+
+	chunk_bytes = 2ULL * SCRYPT_BLOCK_BYTES * SCRYPT_R;
+	V  = scrypt_alloc(Nsize * chunk_bytes);
+	YX = scrypt_alloc((SCRYPT_P + 1) * chunk_bytes);
+
+	memset(V.ptr, 0, (size_t) (Nsize * chunk_bytes));
+
+	Y = YX.ptr;
+	X = Y + chunk_bytes;
+
+	scrypt_jane_hash_1_1((uchar*)input, 80, (uchar*)input, 80, (uint32_t) Nsize, (uchar*)output, 32, X, Y, V.ptr);
+
+	scrypt_free(&V);
+	scrypt_free(&YX);
 }

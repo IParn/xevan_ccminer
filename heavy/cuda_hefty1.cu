@@ -31,7 +31,8 @@ uint32_t hefty_cpu_hashTable[] = {
     0x510e527fUL,
     0x9b05688cUL,
     0x1f83d9abUL,
-    0x5be0cd19UL };
+    0x5be0cd19UL
+};
 
 uint32_t hefty_cpu_constantTable[] = {
     0x428a2f98UL, 0x71374491UL, 0xb5c0fbcfUL, 0xe9b5dba5UL,
@@ -268,30 +269,38 @@ void hefty_gpu_hash(uint32_t threads, uint32_t startNounce, uint32_t *outputHash
 
 // Progress W2 (Bytes 64...127) then W3 (Bytes 128...191) ...
 
+
         for(int k=0;k<3;k++)
         {
+
             for(int j=0;j<2;j++)
                 W2[j] = s1(W1[14+j]) + W1[9+j] + s0(W1[1+j]) + W1[j];
+
             for(int j=2;j<7;j++)
                 W2[j] = s1(W2[j-2]) + W1[9+j] + s0(W1[1+j]) + W1[j];
+
 
             for(int j=7;j<15;j++)
                 W2[j] = s1(W2[j-2]) + W2[j-7] + s0(W1[1+j]) + W1[j];
 
             W2[15] = s1(W2[13]) + W2[8] + s0(W2[0]) + W1[15];
 
+
             for(int j=0;j<16;j++)
             {
                 Absorb(sponge, regs[3] + regs[7]);
                 hefty_gpu_round(regs, W2[j], heftyLookUp(j + ((k+1)<<4)), sponge);
             }
+
             for(int j=0;j<16;j++)
                 W1[j] = W2[j];
         }
 
+#pragma unroll 8
         for(int k=0;k<8;k++)
             hash[k] += regs[k];
 
+#pragma unroll 8
         for(int k=0;k<8;k++)
             ((uint32_t*)outputHash)[(thread<<3)+k] = SWAB32(hash[k]);
     }
@@ -300,7 +309,7 @@ void hefty_gpu_hash(uint32_t threads, uint32_t startNounce, uint32_t *outputHash
 __host__
 void hefty_cpu_init(int thr_id, uint32_t threads)
 {
-    CUDA_SAFE_CALL(cudaSetDevice(device_map[thr_id]));
+    cudaSetDevice(device_map[thr_id]);
 
     // Kopiere die Hash-Tabellen in den GPU-Speicher
     cudaMemcpyToSymbol( hefty_gpu_constantTable,
@@ -308,7 +317,13 @@ void hefty_cpu_init(int thr_id, uint32_t threads)
                         sizeof(uint32_t) * 64 );
 
     // Speicher für alle Hefty1 hashes belegen
-    CUDA_SAFE_CALL(cudaMalloc(&heavy_heftyHashes[thr_id], 8 * sizeof(uint32_t) * threads));
+    CUDA_SAFE_CALL(cudaMalloc(&heavy_heftyHashes[thr_id], (size_t) 32 * threads));
+}
+
+__host__
+void hefty_cpu_free(int thr_id)
+{
+    cudaFree(heavy_heftyHashes[thr_id]);
 }
 
 __host__
@@ -399,4 +414,34 @@ void hefty_cpu_hash(int thr_id, uint32_t threads, int startNounce)
 
     hefty_gpu_hash <<< grid, block, shared_size >>> (threads, startNounce, heavy_heftyHashes[thr_id]);
 
+    // Strategisches Sleep Kommando zur Senkung der CPU Last
+    MyStreamSynchronize(NULL, 0, thr_id);
 }
+
+__global__
+__launch_bounds__(128, 8)
+void hefty_gpu_copy(const uint32_t threads, uint32_t* d_heftyhash, uint64_t* d_hash)
+{
+    const uint32_t thread = (blockDim.x * blockIdx.x + threadIdx.x);
+    if (thread < threads)
+    {
+        const uint32_t offset = thread * 8U; // 32 / sizeof(uint32_t);
+        uint4 *psrc = (uint4*) (&d_heftyhash[offset]);
+        uint4 *pdst = (uint4*) (&d_hash[offset]);
+        pdst[0] = psrc[0];
+        pdst[1] = psrc[1];
+        pdst[2] = make_uint4(0,0,0,0);
+        pdst[3] = make_uint4(0,0,0,0);
+    }
+}
+
+__host__
+void hefty_copy_hashes(int thr_id, uint32_t threads, uint32_t* d_outputhash)
+{
+    const uint32_t threadsperblock = 128;
+    dim3 grid((threads + threadsperblock - 1) / threadsperblock);
+    dim3 block(threadsperblock);
+    hefty_gpu_copy <<< grid, block >>> (threads, heavy_heftyHashes[thr_id], (uint64_t*) d_outputhash);
+    cudaStreamSynchronize(NULL);
+}
+

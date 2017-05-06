@@ -8,11 +8,11 @@
  * Software Foundation; either version 2 of the License, or (at your option)
  * any later version.  See COPYING for more details.
  */
-#define APIVERSION "1.3"
+#define APIVERSION "1.9"
 
 #ifdef WIN32
 # define  _WINSOCK_DEPRECATED_NO_WARNINGS
-//# include <winsock2.h>
+# include <winsock2.h>
 #endif
 
 #include <stdio.h>
@@ -33,6 +33,7 @@
 
 #include "miner.h"
 #include "nvml.h"
+#include "algos.h"
 
 #ifndef WIN32
 # include <errno.h>
@@ -91,18 +92,15 @@ static int bye = 0;
 
 extern char *opt_api_allow;
 extern int opt_api_listen; /* port */
-extern uint32_t accepted_count;
-extern uint32_t rejected_count;
-extern int num_cpus;
+extern int opt_api_remote;
+
+// current stratum...
 extern struct stratum_ctx stratum;
-extern char* rpc_user;
 
 // sysinfos.cpp
+extern int num_cpus;
 extern float cpu_temp(int);
 extern uint32_t cpu_clock(int);
-// cuda.cpp
-int cuda_num_devices();
-int cuda_gpu_clocks(struct cgpu_info *gpu);
 
 char driver_version[32] = { 0 };
 
@@ -110,11 +108,17 @@ char driver_version[32] = { 0 };
 
 static void gpustatus(int thr_id)
 {
+	struct pool_infos *p = &pools[cur_pooln];
+
 	if (thr_id >= 0 && thr_id < opt_n_threads) {
 		struct cgpu_info *cgpu = &thr_info[thr_id].gpu;
+		double khashes_per_watt = 0;
 		int gpuid = cgpu->gpu_id;
 		char buf[512]; *buf = '\0';
 		char* card;
+
+		cuda_gpu_info(cgpu);
+		cgpu->gpu_plimit = device_plimit[cgpu->gpu_id];
 
 #ifdef USE_WRAPNVML
 		cgpu->has_monitoring = true;
@@ -122,22 +126,31 @@ static void gpustatus(int thr_id)
 		cgpu->gpu_temp = gpu_temp(cgpu);
 		cgpu->gpu_fan = (uint16_t) gpu_fanpercent(cgpu);
 		cgpu->gpu_fan_rpm = (uint16_t) gpu_fanrpm(cgpu);
+		cgpu->gpu_power = gpu_power(cgpu); // mWatts
+		cgpu->gpu_plimit = gpu_plimit(cgpu); // mW or %
 #endif
-		cuda_gpu_clocks(cgpu);
-
-		// todo: per gpu
-		cgpu->accepted = accepted_count;
-		cgpu->rejected = rejected_count;
-
-		cgpu->khashes = stats_get_speed(cgpu->gpu_id, 0.0) / 1000.0;
+		cgpu->khashes = stats_get_speed(thr_id, 0.0) / 1000.0;
+		if (cgpu->monitor.gpu_power) {
+			cgpu->gpu_power = cgpu->monitor.gpu_power;
+			khashes_per_watt = (double)cgpu->khashes / cgpu->monitor.gpu_power;
+			khashes_per_watt *= 1000; // power in mW
+			//gpulog(LOG_BLUE, thr_id, "KHW: %g", khashes_per_watt);
+		}
 
 		card = device_name[gpuid];
 
-		snprintf(buf, sizeof(buf), "GPU=%d;BUS=%hd;CARD=%s;"
-			"TEMP=%.1f;FAN=%hu;RPM=%hu;FREQ=%d;KHS=%.2f;HWF=%d;I=%.1f;THR=%u|",
-			gpuid, cgpu->gpu_bus, card, cgpu->gpu_temp, cgpu->gpu_fan,
-			cgpu->gpu_fan_rpm, cgpu->gpu_clock, cgpu->khashes,
-			cgpu->hw_errors, cgpu->intensity, cgpu->throughput);
+		snprintf(buf, sizeof(buf), "GPU=%d;BUS=%hd;CARD=%s;TEMP=%.1f;"
+			"POWER=%u;FAN=%hu;RPM=%hu;"
+			"FREQ=%u;MEMFREQ=%u;GPUF=%u;MEMF=%u;"
+			"KHS=%.2f;KHW=%.5f;PLIM=%u;"
+			"ACC=%u;REJ=%u;HWF=%u;I=%.1f;THR=%u|",
+			gpuid, cgpu->gpu_bus, card, cgpu->gpu_temp,
+			cgpu->gpu_power, cgpu->gpu_fan, cgpu->gpu_fan_rpm,
+			cgpu->gpu_clock/1000, cgpu->gpu_memclock/1000, // base freqs in MHz
+			cgpu->monitor.gpu_clock, cgpu->monitor.gpu_memclock, // current
+			cgpu->khashes, khashes_per_watt, cgpu->gpu_plimit,
+			cgpu->accepted, (unsigned) cgpu->rejected, (unsigned) cgpu->hw_errors,
+			cgpu->intensity, cgpu->throughput);
 
 		// append to buffer for multi gpus
 		strcat(buffer, buf);
@@ -162,21 +175,31 @@ static char *getthreads(char *params)
 */
 static char *getsummary(char *params)
 {
-	char algo[64]; *algo = '\0';
+	char algo[64] = { 0 };
 	time_t ts = time(NULL);
-	double uptime = difftime(ts, startup);
-	double accps = (60.0 * accepted_count) / (uptime ? uptime : 1.0);
+	double accps, uptime = difftime(ts, startup);
+	uint32_t wait_time = 0, solved_count = 0;
+	uint32_t accepted_count = 0, rejected_count = 0;
+	for (int p = 0; p < num_pools; p++) {
+		wait_time += pools[p].wait_time;
+		accepted_count += pools[p].accepted_count;
+		rejected_count += pools[p].rejected_count;
+		solved_count += pools[p].solved_count;
+	}
+	accps = (60.0 * accepted_count) / (uptime ? uptime : 1.0);
 
 	get_currentalgo(algo, sizeof(algo));
 
 	*buffer = '\0';
 	sprintf(buffer, "NAME=%s;VER=%s;API=%s;"
-		"ALGO=%s;GPUS=%d;KHS=%.2f;ACC=%d;REJ=%d;"
-		"ACCMN=%.3f;DIFF=%.6f;UPTIME=%.0f;TS=%u|",
+		"ALGO=%s;GPUS=%d;KHS=%.2f;SOLV=%d;ACC=%d;REJ=%d;"
+		"ACCMN=%.3f;DIFF=%.6f;NETKHS=%.0f;"
+		"POOLS=%u;WAIT=%u;UPTIME=%.0f;TS=%u|",
 		PACKAGE_NAME, PACKAGE_VERSION, APIVERSION,
-		algo, active_gpus, (double)global_hashrate / 1000.0,
-		accepted_count, rejected_count,
-		accps, global_diff, uptime, (uint32_t) ts);
+		algo, active_gpus, (double)global_hashrate / 1000.,
+		solved_count, accepted_count, rejected_count,
+		accps, net_diff > 1e-6 ? net_diff : stratum_diff, (double)net_hashrate / 1000.,
+		num_pools, wait_time, uptime, (uint32_t) ts);
 	return buffer;
 }
 
@@ -185,31 +208,42 @@ static char *getsummary(char *params)
  */
 static char *getpoolnfo(char *params)
 {
-	char *p = buffer;
+	char *s = buffer;
 	char jobid[128] = { 0 };
-	char nonce[128] = { 0 };
-	*p = '\0';
+	char extra[96] = { 0 };
+	int pooln = params ? atoi(params) % num_pools : cur_pooln;
+	struct pool_infos *p = &pools[pooln];
+	uint32_t last_share = 0;
+	if (p->last_share_time)
+		last_share = (uint32_t) (time(NULL) - p->last_share_time);
 
-	if (!stratum.url) {
-		sprintf(p, "|");
-		return p;
-	}
+	*s = '\0';
 
 	if (stratum.job.job_id)
 		strncpy(jobid, stratum.job.job_id, sizeof(stratum.job.job_id));
-
 	if (stratum.job.xnonce2) {
 		/* used temporary to be sure all is ok */
-		cbin2hex(nonce, (const char*) stratum.job.xnonce2, stratum.xnonce2_size);
+		sprintf(extra, "0x");
+		if (p->algo == ALGO_DECRED) {
+			char compat[32] = { 0 };
+			cbin2hex(&extra[2], (const char*) stratum.xnonce1, min(36, stratum.xnonce2_size));
+			cbin2hex(compat, (const char*) stratum.job.xnonce2, 4);
+			memcpy(&extra[2], compat, 8); // compat extranonce
+		} else {
+			cbin2hex(&extra[2], (const char*) stratum.job.xnonce2, stratum.xnonce2_size);
+		}
 	}
 
-	snprintf(p, MYBUFSIZ, "URL=%s;USER=%s;H=%u;JOB=%s;DIFF=%.6f;N2SZ=%d;N2=0x%s;PING=%u;DISCO=%u;UPTIME=%u|",
-		stratum.url, rpc_user ? rpc_user : "",
-		stratum.job.height, jobid, stratum.job.diff,
-		(int) stratum.xnonce2_size, nonce, stratum.answer_msec,
-		stratum.disconnects, (uint32_t) (time(NULL) - stratum.tm_connected));
+	snprintf(s, MYBUFSIZ, "POOL=%s;ALGO=%s;URL=%s;USER=%s;SOLV=%d;ACC=%d;REJ=%d;STALE=%u;H=%u;JOB=%s;DIFF=%.6f;"
+		"BEST=%.6f;N2SZ=%d;N2=%s;PING=%u;DISCO=%u;WAIT=%u;UPTIME=%u;LAST=%u|",
+		strlen(p->name) ? p->name : p->short_url, algo_names[p->algo],
+		p->url, p->type & POOL_STRATUM ? p->user : "",
+		p->solved_count, p->accepted_count, p->rejected_count, p->stales_count,
+		stratum.job.height, jobid, stratum_diff, p->best_share,
+		(int) stratum.xnonce2_size, extra, stratum.answer_msec,
+		p->disconnects, p->wait_time, p->work_time, last_share);
 
-	return p;
+	return s;
 }
 
 /*****************************************************************************/
@@ -231,31 +265,40 @@ static void gpuhwinfos(int gpu_id)
 	if (cgpu == NULL)
 		return;
 
+	cuda_gpu_info(cgpu);
+	cgpu->gpu_plimit = device_plimit[cgpu->gpu_id];
+
 #ifdef USE_WRAPNVML
 	cgpu->has_monitoring = true;
 	cgpu->gpu_bus = gpu_busid(cgpu);
 	cgpu->gpu_temp = gpu_temp(cgpu);
 	cgpu->gpu_fan = (uint16_t) gpu_fanpercent(cgpu);
 	cgpu->gpu_fan_rpm = (uint16_t) gpu_fanrpm(cgpu);
-	cgpu->gpu_pstate = gpu_pstate(cgpu);
+	cgpu->gpu_pstate = (int16_t) gpu_pstate(cgpu);
+	cgpu->gpu_power = gpu_power(cgpu);
+	cgpu->gpu_plimit = gpu_plimit(cgpu);
 	gpu_info(cgpu);
+#ifdef WIN32
+	if (opt_debug) nvapi_pstateinfo(cgpu->gpu_id);
 #endif
-
-	cuda_gpu_clocks(cgpu);
+#endif
 
 	memset(pstate, 0, sizeof(pstate));
 	if (cgpu->gpu_pstate != -1)
-		snprintf(pstate, sizeof(pstate), "P%hu", cgpu->gpu_pstate);
+		snprintf(pstate, sizeof(pstate), "P%d", (int) cgpu->gpu_pstate);
 
 	card = device_name[gpu_id];
 
-	snprintf(buf, sizeof(buf), "GPU=%d;BUS=%hd;CARD=%s;SM=%u;MEM=%lu;"
-		"TEMP=%.1f;FAN=%hu;RPM=%hu;FREQ=%d;MEMFREQ=%d;PST=%s;"
+	snprintf(buf, sizeof(buf), "GPU=%d;BUS=%hd;CARD=%s;SM=%hu;MEM=%u;"
+		"TEMP=%.1f;FAN=%hu;RPM=%hu;FREQ=%u;MEMFREQ=%u;GPUF=%u;MEMF=%u;"
+		"PST=%s;POWER=%u;PLIM=%u;"
 		"VID=%hx;PID=%hx;NVML=%d;NVAPI=%d;SN=%s;BIOS=%s|",
-		gpu_id, cgpu->gpu_bus, card, cgpu->gpu_arch, cgpu->gpu_mem,
+		gpu_id, cgpu->gpu_bus, card, cgpu->gpu_arch, (uint32_t) cgpu->gpu_mem,
 		cgpu->gpu_temp, cgpu->gpu_fan, cgpu->gpu_fan_rpm,
-		cgpu->gpu_clock, cgpu->gpu_memclock,
-		pstate, cgpu->gpu_vid, cgpu->gpu_pid, cgpu->nvml_id, cgpu->nvapi_id,
+		cgpu->gpu_clock/1000U, cgpu->gpu_memclock/1000U, // base clocks
+		cgpu->monitor.gpu_clock, cgpu->monitor.gpu_memclock, // current
+		pstate, cgpu->gpu_power, cgpu->gpu_plimit,
+		cgpu->gpu_vid, cgpu->gpu_pid, cgpu->nvml_id, cgpu->nvapi_id,
 		cgpu->gpu_sn, cgpu->gpu_desc);
 
 	strcat(buffer, buf);
@@ -291,7 +334,7 @@ static void syshwinfos()
 
 	memset(buf, 0, sizeof(buf));
 	snprintf(buf, sizeof(buf), "OS=%s;NVDRIVER=%s;CPUS=%d;CPUTEMP=%d;CPUFREQ=%d|",
-		os_name(), driver_version, num_cpus, cputc, cpuclk);
+		os_name(), driver_version, num_cpus, cputc, cpuclk/1000);
 	strcat(buffer, buf);
 }
 
@@ -322,7 +365,7 @@ static char *gethistory(char *params)
 	*buffer = '\0';
 	for (int i = 0; i < records; i++) {
 		time_t ts = data[i].tm_stat;
-		p += sprintf(p, "GPU=%d;H=%u;KHS=%.2f;DIFF=%.6f;"
+		p += sprintf(p, "GPU=%d;H=%u;KHS=%.2f;DIFF=%g;"
 				"COUNT=%u;FOUND=%u;ID=%u;TS=%u|",
 			data[i].gpu_id, data[i].height, data[i].hashrate, data[i].difficulty,
 			data[i].hashcount, data[i].hashfound, data[i].uid, (uint32_t)ts);
@@ -331,7 +374,7 @@ static char *gethistory(char *params)
 }
 
 /**
- * Returns the job scans ranges (debug purpose)
+ * Returns the job scans ranges (debug purpose, only with -D)
  */
 static char *getscanlog(char *params)
 {
@@ -341,9 +384,11 @@ static char *getscanlog(char *params)
 	*buffer = '\0';
 	for (int i = 0; i < records; i++) {
 		time_t ts = data[i].tm_upd;
-		p += sprintf(p, "H=%u;JOB=%u;N=%u;FROM=0x%x;SCANTO=0x%x;"
+		p += sprintf(p, "H=%u;P=%u;JOB=%u;ID=%d;DIFF=%g;"
+				"N=0x%x;FROM=0x%x;SCANTO=0x%x;"
 				"COUNT=0x%x;FOUND=%u;TS=%u|",
-			data[i].height, data[i].njobid, data[i].nonce, data[i].scanned_from, data[i].scanned_to,
+			data[i].height, data[i].npool, data[i].njobid, (int)data[i].job_nonce_id, data[i].sharediff,
+			data[i].nonce, data[i].scanned_from, data[i].scanned_to,
 			(data[i].scanned_to - data[i].scanned_from), data[i].tm_sent ? 1 : 0, (uint32_t)ts);
 	}
 	return buffer;
@@ -370,6 +415,74 @@ static char *getmeminfo(char *params)
 
 /*****************************************************************************/
 
+/**
+ * Remote control allowed ?
+ * TODO: ip filters
+ */
+static bool check_remote_access(void)
+{
+	return (opt_api_remote > 0);
+}
+
+/**
+ * Set pool by index (pools array in json config)
+ * switchpool|1|
+ */
+static char *remote_switchpool(char *params)
+{
+	bool ret = false;
+	*buffer = '\0';
+	if (!check_remote_access())
+		return buffer;
+	if (!params || strlen(params) == 0) {
+		// rotate pool test
+		ret = pool_switch_next(-1);
+	} else {
+		int n = atoi(params);
+		if (n == cur_pooln)
+			ret = true;
+		else if (n < num_pools)
+			ret = pool_switch(-1, n);
+	}
+	sprintf(buffer, "%s|", ret ? "ok" : "fail");
+	return buffer;
+}
+
+/**
+ * Change pool url (see --url parameter)
+ * seturl|stratum+tcp://<user>:<pass>@mine.xpool.ca:1131|
+ */
+static char *remote_seturl(char *params)
+{
+	bool ret;
+	*buffer = '\0';
+	if (!check_remote_access())
+		return buffer;
+	if (!params || strlen(params) == 0) {
+		// rotate pool test
+		ret = pool_switch_next(-1);
+	} else {
+		ret = pool_switch_url(params);
+	}
+	sprintf(buffer, "%s|", ret ? "ok" : "fail");
+	return buffer;
+}
+
+/**
+ * Ask the miner to quit
+ */
+static char *remote_quit(char *params)
+{
+	*buffer = '\0';
+	if (!check_remote_access())
+		return buffer;
+	bye = 1;
+	sprintf(buffer, "%s", "bye|");
+	return buffer;
+}
+
+/*****************************************************************************/
+
 static char *gethelp(char *params);
 struct CMDS {
 	const char *name;
@@ -382,6 +495,12 @@ struct CMDS {
 	{ "hwinfo",  gethwinfos },
 	{ "meminfo", getmeminfo },
 	{ "scanlog", getscanlog },
+
+	/* remote functions */
+	{ "seturl",  remote_seturl }, /* prefer switchpool, deprecated */
+	{ "switchpool", remote_switchpool },
+	{ "quit",    remote_quit },
+
 	/* keep it the last */
 	{ "help",    gethelp },
 };
@@ -406,7 +525,7 @@ static int send_result(SOCKETTYPE c, char *result)
 		n = send(c, "", 1, 0);
 	} else {
 		// ignore failure - it's closed immediately anyway
-		n = send(c, result, strlen(result) + 1, 0);
+		n = send(c, result, (int) strlen(result) + 1, 0);
 	}
 	return n;
 }
@@ -549,7 +668,7 @@ static int websocket_handshake(SOCKETTYPE c, char *result, char *clientkey)
 		// WebSocket Frame - Header + Data
 		memcpy(p, hd, frames);
 		memcpy(p + frames, result, (size_t)datalen);
-		send(c, (const char*)data, strlen(answer) + frames + (size_t)datalen + 1, 0);
+		send(c, (const char*)data, (int) (strlen(answer) + frames + datalen + 1), 0);
 		free(data);
 	}
 	return 0;
@@ -619,7 +738,7 @@ static void setup_ipaccess()
 
 				ipaccess[ips].mask = 0;
 				while (mask-- >= 0) {
-					octet = 1 << (mask & 7);
+					octet = 1 << (mask % 8);
 					ipaccess[ips].mask |= (octet << (24 - (8 * (mask >> 3))));
 				}
 			}
@@ -676,9 +795,9 @@ static bool check_connect(struct sockaddr_in *cli, char **connectaddr, char *gro
 static void api()
 {
 	const char *addr = opt_api_allow;
-	short int port = opt_api_listen; // 4068
+	unsigned short port = (unsigned short) opt_api_listen; // 4068
 	char buf[MYBUFSIZ];
-	int c, n, bound;
+	int n, bound;
 	char *connectaddr;
 	char *binderror;
 	char group;
@@ -692,6 +811,7 @@ static void api()
 	char *params;
 	int i;
 
+	SOCKETTYPE c;
 	SOCKETTYPE *apisock;
 	if (!opt_api_listen && opt_debug) {
 		applog(LOG_DEBUG, "API disabled");
@@ -748,14 +868,29 @@ static void api()
 			binderror = strerror(errno);
 			if ((time(NULL) - bindstart) > 61)
 				break;
-			else {
+			else if (opt_api_listen == 4068) {
+				/* when port is default one, use first available */
+				if (opt_debug)
+					applog(LOG_DEBUG, "API bind to port %d failed, trying port %u",
+						port, (uint32_t) port+1);
+				port++;
+				serv.sin_port = htons(port);
+				sleep(1);
+			} else {
 				if (!opt_quiet || opt_debug)
-					applog(LOG_WARNING, "API bind to port %d failed - trying again in 20sec", port);
+					applog(LOG_WARNING, "API bind to port %u failed - trying again in 20sec",
+						(uint32_t) port);
 				sleep(20);
 			}
 		}
-		else
+		else {
 			bound = 1;
+			if (opt_api_listen != port) {
+				applog(LOG_WARNING, "API bind to port %d failed - using port %u",
+					opt_api_listen, (uint32_t) port);
+				opt_api_listen = port;
+			}
+		}
 	}
 
 	if (bound == 0) {
@@ -774,11 +909,12 @@ static void api()
 	buffer = (char *) calloc(1, MYBUFSIZ + 1);
 
 	counter = 0;
-	while (bye == 0) {
+	while (bye == 0 && !abort_flag) {
 		counter++;
 
 		clisiz = sizeof(cli);
-		if (SOCKETFAIL(c = accept(*apisock, (struct sockaddr *)(&cli), &clisiz))) {
+		c = accept(*apisock, (struct sockaddr*) (&cli), &clisiz);
+		if (SOCKETFAIL(c)) {
 			applog(LOG_ERR, "API failed (%s)%s", strerror(errno), UNAVAILABLE);
 			CLOSESOCKET(*apisock);
 			free(apisock);
@@ -842,6 +978,11 @@ static void api()
 
 				for (i = 0; i < CMDMAX; i++) {
 					if (strcmp(buf, cmds[i].name) == 0 && strlen(buf)) {
+						if (params && strlen(params)) {
+							// remove possible trailing |
+							if (params[strlen(params)-1] == '|')
+								params[strlen(params)-1] = '\0';
+						}
 						result = (cmds[i].func)(params);
 						if (wskey) {
 							websocket_handshake(c, result, wskey);
@@ -868,8 +1009,12 @@ void *api_thread(void *userdata)
 
 	startup = time(NULL);
 	api();
-
 	tq_freeze(mythr->q);
+
+	if (bye) {
+		// quit command
+		proper_exit(1);
+	}
 
 	return NULL;
 }
@@ -877,17 +1022,11 @@ void *api_thread(void *userdata)
 /* to be able to report the default value set in each algo */
 void api_set_throughput(int thr_id, uint32_t throughput)
 {
-	struct cgpu_info *cgpu = &thr_info[thr_id].gpu;
-	if (cgpu) {
-		uint32_t ws = throughput;
-		uint8_t i = 0;
-		cgpu->throughput = throughput;
-		while (ws > 1 && i++ < 32)
-			ws = ws >> 1;
-		cgpu->intensity_int = i;
-		cgpu->intensity = (float) i;
-		if (i && (1U << i) < throughput) {
-			cgpu->intensity += ((float) (throughput-(1U << i)) / (1U << i));
-		}
+	if (thr_id < MAX_GPUS && thr_info) {
+		struct cgpu_info *cgpu = &thr_info[thr_id].gpu;
+		cgpu->intensity = throughput2intensity(throughput);
 	}
+	// to display in bench results
+	if (opt_benchmark)
+		bench_set_throughput(thr_id, throughput);
 }
