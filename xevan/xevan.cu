@@ -83,25 +83,26 @@ extern void quark_compactTest_cpu_hash_64(int thr_id, uint32_t threads, uint32_t
 // Xevan
 extern "C" void xevan_hash(void *output, const void *input)
 {
-	// blake1-bmw2-grs3-skein4-jh5-keccak6-luffa7-cubehash8-shavite9-simd10-echo11-hamsi12-fugue13-shabal14-whirlpool15-sha512-haval17
+	sph_blake512_context     ctx_blake;
+    sph_bmw512_context       ctx_bmw;
+    sph_groestl512_context   ctx_groestl;
+    sph_skein512_context     ctx_skein;
+    sph_jh512_context        ctx_jh;
+    sph_keccak512_context    ctx_keccak;
 
-	sph_blake512_context ctx_blake;
-	sph_bmw512_context ctx_bmw;
-	sph_groestl512_context ctx_groestl;
-	sph_jh512_context ctx_jh;
-	sph_keccak512_context ctx_keccak;
-	sph_skein512_context ctx_skein;
-	sph_luffa512_context ctx_luffa;
-	sph_cubehash512_context ctx_cubehash;
-	sph_shavite512_context ctx_shavite;
-	sph_simd512_context ctx_simd;
-	sph_echo512_context ctx_echo;
-	sph_hamsi512_context ctx_hamsi;
-	sph_fugue512_context ctx_fugue;
-	sph_shabal512_context ctx_shabal;
-	sph_whirlpool_context ctx_whirlpool;
-	sph_sha512_context ctx_sha512;
-	sph_haval256_5_context ctx_haval;
+    sph_luffa512_context		ctx_luffa1;
+    sph_cubehash512_context		ctx_cubehash1;
+    sph_shavite512_context		ctx_shavite1;
+    sph_simd512_context		ctx_simd1;
+    sph_echo512_context		ctx_echo1;
+	
+	sph_hamsi512_context		ctx_hamsi;
+    sph_fugue512_context		ctx_fugue;
+    sph_shabal512_context		ctx_shabal;
+    sph_whirlpool_context		ctx_whirlpool;
+    sph_sha512_context		    ctx_sha2;
+	
+	sph_haval256_5_context		ctx_haval;
 
 	uint32_t hashA[32], hashB[32];
 	memset(hashA , 0, 128);
