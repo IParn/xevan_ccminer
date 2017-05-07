@@ -273,7 +273,6 @@ Options:\n\
 			x14         X14\n\
 			x15         X15\n\
 			x17         X17\n\
-			xevan       XEVAN\n\
 			wildkeccak  Boolberry\n\
 			zr5         ZR5 (ZiftrCoin)\n\
   -d, --devices         Comma separated list of CUDA devices to use.\n\
@@ -2365,9 +2364,6 @@ static void *miner_thread(void *userdata)
 			break;
 		case ALGO_X17:
 			rc = scanhash_x17(thr_id, &work, max_nonce, &hashes_done);
-			break;
-		case ALGO_XEVAN:
-			rc = scanhash_xevan(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_ZR5:
 			rc = scanhash_zr5(thr_id, &work, max_nonce, &hashes_done);
