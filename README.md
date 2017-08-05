@@ -34,5 +34,3 @@ To rebuild them, you need to clone this repository and its submodules :
 
 On Linux, you can use the helper ./build.sh (edit it if required)
 
-There is also an old [Tutorial for windows](http://cudamining.co.uk/url/tutorials/id/3) on [CudaMining](http://cudamining.co.uk) website.
-
